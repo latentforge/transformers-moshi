@@ -708,15 +708,22 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
             print(output_ids_generate)
             self.assertIsNotNone(output_ids_generate)
 
-    @pytest.mark.xfail(reason="This architecture seems to not compute gradients for some layer.")
+    # The common test asserts on the first `GradientCheckpointingLayer` found in module order. For
+    # `MoshiForConditionalGeneration` that is a `MimiTransformerLayer` inside the embedded `audio_encoder`, which
+    # this test never runs: the inputs are already-encoded audio codes, so the codec's encoder is not called and
+    # the mocked forward count stays 0. Checkpointing itself works on Moshi's own layers (a `MoshiDecoderLayer`
+    # forward is called twice under checkpointing).
+    _gradient_checkpointing_xfail = "Asserts on the audio encoder's layer, which this test's inputs never exercise."
+
+    @pytest.mark.xfail(reason=_gradient_checkpointing_xfail)
     def test_training_gradient_checkpointing(self):
         super().test_training_gradient_checkpointing()
 
-    @pytest.mark.xfail(reason="This architecture seems to not compute gradients for some layer.")
+    @pytest.mark.xfail(reason=_gradient_checkpointing_xfail)
     def test_training_gradient_checkpointing_use_reentrant_false(self):
         super().test_training_gradient_checkpointing_use_reentrant_false()
 
-    @pytest.mark.xfail(reason="This architecture seems to not compute gradients for some layer.")
+    @pytest.mark.xfail(reason=_gradient_checkpointing_xfail)
     def test_training_gradient_checkpointing_use_reentrant_true(self):
         super().test_training_gradient_checkpointing_use_reentrant_true()
 
