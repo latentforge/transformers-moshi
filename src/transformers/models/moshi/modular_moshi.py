@@ -219,6 +219,11 @@ class MoshiConfig(PreTrainedConfig):
             self.audio_encoder_config.codebook_size if self.audio_vocab_size is None else self.audio_vocab_size
         )
 
+        # The depth decoder consumes the main decoder's hidden states and codebooks, so these four values must
+        # mirror the parent. `None` is treated as an empty dict so the defaults get synced too, instead of
+        # silently keeping `MoshiDepthConfig`'s own (e.g. `input_size=4096`) and failing at runtime.
+        if self.depth_decoder_config is None:
+            self.depth_decoder_config = {}
         if isinstance(self.depth_decoder_config, dict):
             self.depth_decoder_config.update(
                 {
@@ -229,8 +234,6 @@ class MoshiConfig(PreTrainedConfig):
                 }
             )
             self.depth_decoder_config = MoshiDepthConfig(**self.depth_decoder_config)
-        elif self.depth_decoder_config is None:
-            self.depth_decoder_config = MoshiDepthConfig()
         super().__post_init__(**kwargs)
 
     def validate_architecture(self):
