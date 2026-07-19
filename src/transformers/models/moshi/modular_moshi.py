@@ -256,7 +256,9 @@ class MoshiConfig(PreTrainedConfig):
             # heads were dropped, but a model trained to predict both streams has twice as many. So the parent's
             # value is only a default here.
             self.depth_decoder_config.setdefault("num_codebooks", 2 * self.num_codebooks)
-            self.depth_decoder_config = MoshiDepthConfig(**self.depth_decoder_config)
+            # Resolved through `sub_configs` rather than named directly, so a subclass that swaps in its own depth
+            # config class gets it built here instead of silently ending up with Moshi's.
+            self.depth_decoder_config = self.sub_configs["depth_decoder_config"](**self.depth_decoder_config)
 
         super().__post_init__(**kwargs)
 
