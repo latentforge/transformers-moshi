@@ -41,6 +41,7 @@ from ..auto.modeling_auto import AutoModel
 from ..llama.modeling_llama import (
     LlamaAttention,
     LlamaDecoderLayer,
+    LlamaForCausalLM,
     LlamaModel,
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
@@ -69,13 +70,13 @@ class MoshiDepthConfig(PreTrainedConfig):
     ```python
     >>> from transformers import (
     ...     MoshiDepthConfig,
-    ...     MoshiDepthDecoder,
+    ...     MoshiDepthDecoderModel,
     ... )
 
     >>> configuration = MoshiDepthConfig()
 
-    >>> # Initializing a MoshiDepthDecoder (with random weights) from the kmhf/hf-moshiko style configuration
-    >>> model = MoshiDepthDecoder(configuration)
+    >>> # Initializing a MoshiDepthDecoderModel (with random weights) from the kmhf/hf-moshiko style configuration
+    >>> model = MoshiDepthDecoderModel(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
@@ -160,6 +161,23 @@ class MoshiConfig(PreTrainedConfig):
     model_type = "moshi"
     keys_to_ignore_at_inference = ["past_key_values"]
     sub_configs = {"audio_encoder_config": AutoConfig, "depth_decoder_config": MoshiDepthConfig}
+    # The projections are wrapped in `MoshiLinear`, hence the extra `.linear`.
+    base_model_tp_plan = {
+        "layers.*.self_attn.q_proj.linear": "colwise",
+        "layers.*.self_attn.k_proj.linear": "colwise",
+        "layers.*.self_attn.v_proj.linear": "colwise",
+        "layers.*.self_attn.o_proj.linear": "rowwise",
+        # `fc1` is a fused `[gate; up]` projection that `MoshiGatingMLP` splits with a `view`, so its output
+        # has to be gathered before the split (a plain `colwise` shard would hand whole gate/up halves to
+        # different ranks). `fc2` then takes a replicated input. Same pairing as Phi3's `gate_up_proj`.
+        "layers.*.mlp.fc1": "colwise_gather_output",
+        "layers.*.mlp.fc2": "rowwise_split_input",
+    }
+    base_model_pp_plan = {
+        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
+        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
+        "norm": (["hidden_states"], ["hidden_states"]),
+    }
 
     vocab_size: int = 32000
     hidden_size: int = 4096
@@ -298,33 +316,6 @@ class MoshiConditionalGenerationGenerateOutput(ModelOutput):
     hidden_states: tuple[tuple[torch.FloatTensor]] | None = None
     past_key_values: Cache | None = None
     audio_codes: torch.LongTensor | None = None
-
-
-@auto_docstring(
-    custom_intro="""
-    `MoshiForCausalLM` outputs.
-    """
-)
-@dataclass
-class MoshiCausalLMOutputWithPast(ModelOutput):
-    r"""
-    loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
-        Language modeling loss (for next-token prediction).
-    logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
-        Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-    past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-        It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
-
-        Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
-        `past_key_values` input) to speed up sequential decoding.
-    """
-
-    loss: torch.FloatTensor | None = None
-    logits: torch.FloatTensor | None = None
-    last_hidden_state: torch.FloatTensor | None = None
-    past_key_values: Cache | None = None
-    hidden_states: tuple[torch.FloatTensor, ...] | None = None
-    attentions: tuple[torch.FloatTensor, ...] | None = None
 
 
 @auto_docstring(
@@ -622,7 +613,7 @@ class MoshiPreTrainedModel(PreTrainedModel):
             init.normal_(module.weight)
 
 
-class MoshiDepthDecoder(MoshiPreTrainedModel, GenerationMixin):
+class MoshiDepthDecoderModel(MoshiPreTrainedModel, GenerationMixin):
     """
     Transformer depth decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`MoshiTransformerLayer`]
 
@@ -806,81 +797,10 @@ class MoshiModel(LlamaModel, MoshiPreTrainedModel):
     The Moshi decoder model with a text language modelling head on top. Only usable for text.
     """
 )
-class MoshiForCausalLM(MoshiPreTrainedModel, GenerationMixin):
+class MoshiForCausalLM(LlamaForCausalLM, MoshiPreTrainedModel):
     input_modalities = ("text",)
-
-    def __init__(self, config):
-        super().__init__(config)
-        self.model = MoshiModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-    @can_return_tuple
-    @auto_docstring
-    def forward(
-        self,
-        input_ids: torch.LongTensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        past_key_values: Cache | None = None,
-        inputs_embeds: torch.FloatTensor | None = None,
-        use_cache: bool | None = None,
-        labels: torch.LongTensor | None = None,
-        logits_to_keep: int | torch.Tensor = 0,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> MoshiCausalLMOutputWithPast:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-
-        Example:
-
-        ```python
-        >>> from transformers import AutoTokenizer, MoshiForCausalLM
-
-        >>> model = MoshiForCausalLM.from_pretrained("kmhf/hf-moshiko")
-        >>> tokenizer = AutoTokenizer.from_pretrained("kmhf/hf-moshiko")
-
-        >>> prompt = "What is your favorite condiment?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "What is your favorite condiment?"
-        ```"""
-        outputs: BaseModelOutputWithPast = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            **kwargs,
-        )
-
-        hidden_states = outputs.last_hidden_state
-        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
-        loss = None
-        if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-
-        return MoshiCausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            last_hidden_state=hidden_states,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+    # Moshi's text embedding has one extra id (`vocab_size + 1`) compared to `lm_head`, so the two can never be tied.
+    _tied_weights_keys = None
 
 
 @auto_docstring(
@@ -897,6 +817,10 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, GenerationMixin):
     _supports_sdpa = True
     _supports_flex_attn = True
     _supports_attention_backend = True
+    # Only the text (main) decoder is tensor/pipeline parallel; the depth decoder's per-codebook
+    # `MoshiFlexibleLinear` weights are 3D and do not map onto the standard colwise/rowwise strategies.
+    _tp_plan = {"lm_head": "colwise_gather_output"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config: MoshiConfig):
         super().__init__(config)
@@ -905,9 +829,10 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, GenerationMixin):
             [nn.Embedding(config.audio_vocab_size + 1, config.hidden_size) for _ in range(2 * config.num_codebooks)]
         )
         self.audio_encoder = AutoModel.from_config(config.audio_encoder_config)
-        self.decoder = MoshiForCausalLM(config)
+        self.model = MoshiModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        self.depth_decoder = MoshiDepthDecoder._from_config(config.depth_decoder_config)
+        self.depth_decoder = MoshiDepthDecoderModel._from_config(config.depth_decoder_config)
 
         self.num_codebooks = config.num_codebooks
         self.post_init()
@@ -1015,7 +940,7 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, GenerationMixin):
                 )
 
             if input_ids is not None:
-                inputs_embeds = self.decoder.model.embed_tokens(input_ids)
+                inputs_embeds = self.model.embed_tokens(input_ids)
 
             if audio_codes is not None:
                 audio_inputs_embeds = sum(
@@ -1028,22 +953,25 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, GenerationMixin):
                 )
 
         # Decode
-        decoder_outputs = self.decoder(
+        decoder_outputs: BaseModelOutputWithPast = self.model(
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             use_cache=use_cache,
             past_key_values=past_key_values,
-            return_dict=True,
-            labels=text_labels,
             **kwargs_decoder,
         )
 
         decoder_last_hidden_state = decoder_outputs.last_hidden_state
+        logits = self.lm_head(decoder_last_hidden_state)
+
+        loss = None
+        if text_labels is not None:
+            loss = self.loss_function(logits=logits, labels=text_labels, vocab_size=self.config.vocab_size, **kwargs)
 
         depth_decoder_outputs = None
-        final_loss = decoder_outputs.loss
+        final_loss = loss
         if text_labels is not None and audio_labels is not None:
             # To use depth decoder forward here, we actually need oracle input ids since we're supposed to pass the true input ids
 
@@ -1067,10 +995,12 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, GenerationMixin):
             # (batch_size, sequence_length, dim) -> (batch_size * sequence_length, 1, dim)
             decoder_last_hidden_state = decoder_last_hidden_state.view(-1, 1, decoder_last_hidden_state.shape[-1])
 
+            # No `attention_mask` here: the depth decoder runs on a flattened `(batch * sequence_length)`
+            # batch whose sequence axis is the codebook axis, which is never padded, so the main decoder's
+            # `(batch, sequence_length)` mask neither applies nor has a compatible batch size.
             depth_decoder_outputs = self.depth_decoder(
                 last_hidden_state=decoder_last_hidden_state,
                 input_ids=depth_input_ids,
-                attention_mask=attention_mask,
                 labels=audio_labels,
                 **kwargs_depth_decoder,
             )
@@ -1078,17 +1008,18 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, GenerationMixin):
             final_loss += depth_decoder_outputs.loss
 
         return MoshiConditionalGenerationOutputWithPast(
-            loss=decoder_outputs.loss,
-            logits=decoder_outputs.logits,
+            # `final_loss` is the text loss plus, when `audio_labels` are given, the depth decoder loss
+            loss=final_loss,
+            logits=logits,
             last_hidden_state=decoder_last_hidden_state,
             past_key_values=decoder_outputs.past_key_values,
             hidden_states=decoder_outputs.hidden_states,
             attentions=decoder_outputs.attentions,
             depth_loss=None if depth_decoder_outputs is None else depth_decoder_outputs.loss,
             audio_logits=None if depth_decoder_outputs is None else depth_decoder_outputs.logits,
-            depth_past_key_values=None if decoder_outputs is None else decoder_outputs.past_key_values,
-            depth_hidden_states=None if decoder_outputs is None else decoder_outputs.hidden_states,
-            depth_attentions=None if decoder_outputs is None else decoder_outputs.attentions,
+            depth_past_key_values=None if depth_decoder_outputs is None else depth_decoder_outputs.past_key_values,
+            depth_hidden_states=None if depth_decoder_outputs is None else depth_decoder_outputs.hidden_states,
+            depth_attentions=None if depth_decoder_outputs is None else depth_decoder_outputs.attentions,
         )
 
     def _prepare_attention_mask_for_generation(
@@ -1198,7 +1129,7 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, GenerationMixin):
                 )
 
             if input_ids is not None:
-                inputs_embeds = self.decoder.model.embed_tokens(input_ids)
+                inputs_embeds = self.model.embed_tokens(input_ids)
 
             if audio_inputs_embeds is not None:
                 inputs_embeds = (
@@ -1564,16 +1495,16 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, GenerationMixin):
         return model_kwargs
 
     def get_input_embeddings(self):
-        return self.decoder.get_input_embeddings()
+        return self.model.embed_tokens
 
     def set_input_embeddings(self, value):
-        self.decoder.set_input_embeddings(value)
+        self.model.embed_tokens = value
 
     def get_output_embeddings(self):
-        return self.decoder.get_output_embeddings()
+        return self.lm_head
 
     def set_output_embeddings(self, new_embeddings):
-        self.decoder.set_output_embeddings(new_embeddings)
+        self.lm_head = new_embeddings
 
     def freeze_audio_encoder(self):
         """
@@ -1752,6 +1683,7 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, GenerationMixin):
 __all__ = [
     "MoshiConfig",
     "MoshiDepthConfig",
+    "MoshiDepthDecoderModel",
     "MoshiForCausalLM",
     "MoshiForConditionalGeneration",
     "MoshiModel",

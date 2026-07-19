@@ -141,6 +141,12 @@ _MODEL_TO_CONVERSION_PATTERN = {
 
 def _build_checkpoint_conversion_mapping():
     mapping = {
+        # `MoshiForConditionalGeneration` used to wrap a whole `MoshiForCausalLM` under `decoder`; it now owns a
+        # bare `MoshiModel` plus its own `lm_head`, so published checkpoints need the `decoder.` prefix dropped.
+        # Keyed by class name, not model type: `MoshiModel` and `MoshiForCausalLM` share the `moshi` model type
+        # but never had that prefix. `PrefixChange` anchors at the start, so `depth_decoder.*` and
+        # `audio_encoder.decoder.*` are left alone.
+        "MoshiForConditionalGeneration": [PrefixChange(prefix_to_remove="decoder")],
         "inkling_mm_model": [
             WeightRenaming(source_patterns=r"model\.llm\.layers", target_patterns=r"model.language_model.layers"),
             WeightRenaming(

@@ -456,7 +456,9 @@ class MoshiTester:
         self.mimi_sliding_window = mimi_sliding_window
         self.sampling_rate = sampling_rate
 
-        self.num_hidden_states_types = 2
+        # Only `hidden_states` is added: the depth decoder does not run without `audio_labels`, so
+        # `depth_hidden_states` stays `None`.
+        self.num_hidden_states_types = 1
 
     def prepare_config_and_inputs(self, batch_size=None):
         batch_size = self.batch_size if batch_size is None else batch_size

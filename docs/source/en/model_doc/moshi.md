@@ -49,7 +49,7 @@ Moshi's made of 3 components:
 
 **1. The main decoder (Helium in the paper)**
 
-It corresponds to [`MoshiForCausalLM`]. It is strictly a classic text LLM, that uses an architecture similar to [`~GemmaForCausalLM`]. In other words, it takes text tokens, embeds them, pass them through the decoder and a language head, to get text logits.
+It corresponds to [`MoshiModel`], which [`MoshiForConditionalGeneration`] pairs with its own language modelling head (the same combination is exposed standalone as [`MoshiForCausalLM`]). It is strictly a classic text LLM, that uses an architecture similar to [`~LlamaModel`]. In other words, it takes text tokens, embeds them, pass them through the decoder and a language head, to get text logits.
 
 **2. The depth decoder**
 
@@ -190,3 +190,8 @@ The original code can be found [here](https://github.com/kyutai-labs/moshi).
     - forward
     - generate
     - get_unconditional_inputs
+
+## MoshiDepthDecoderModel
+
+[[autodoc]] MoshiDepthDecoderModel
+    - forward

@@ -55,14 +55,14 @@ def _grab_best_device(use_gpu=True):
 
 convert_list = [
     # GENERAL
-    ("out_norm", "decoder.model.norm"),
+    ("out_norm", "model.norm"),
     ("depformer_emb", "depth_decoder.emb"),
     ("depformer_text_emb", "depth_decoder.text_emb"),
-    ("text_emb", "decoder.model.emb"),
+    ("text_emb", "model.emb"),
     ("emb", "embed_tokens"),
-    ("text_linear", "decoder.lm_head"),
+    ("text_linear", "lm_head"),
     ("depformer", "depth_decoder"),
-    ("transformer", "decoder.model"),
+    ("transformer", "model"),
     # TRANSFORMERS PART
     ("gating.linear_in", "mlp.fc1"),
     ("gating.linear_out", "mlp.fc2"),
@@ -173,7 +173,7 @@ def _convert_model(
 
     # Do the last one by hand
     state_dict["depth_decoder.text_embed_tokens.weight"] = state_dict.pop(
-        "depth_decoder.decoder.model.embed_tokens.weight"
+        "depth_decoder.model.embed_tokens.weight"
     )
 
     extra_keys = set(state_dict.keys()) - set(hf_model.state_dict().keys())
