@@ -387,10 +387,11 @@ class MoshiGenerationMixin(GenerationMixin):
 
         attention_mask = kwargs.pop("attention_mask", None)
         if attention_mask is None:
-            # `_prepare_attention_mask_for_generation` reads the normalized `_pad_token_tensor` /
-            # `_eos_token_tensor`, which `generate` would only set later, so resolve them up front here.
-            self._prepare_special_tokens(generation_config, device=input_ids.device)
-            attention_mask = self._prepare_attention_mask_for_generation(input_ids, generation_config, kwargs)
+            # Not derived by comparing `input_ids` against `pad_token_id`, the way the base implementation does.
+            # Moshi's text stream starts on `vocab_size`, and the released checkpoints set `pad_token_id` to that
+            # same id, so that comparison marks the prompt itself as padding and the model attends to nothing --
+            # silently, and the text stream degenerates. Every frame handed to `generate` is real content here.
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
         (
             inputs_embeds,
             input_ids,
