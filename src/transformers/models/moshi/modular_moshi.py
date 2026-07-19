@@ -805,6 +805,9 @@ class MoshiForCausalLM(LlamaForCausalLM, MoshiPreTrainedModel):
 )
 class MoshiForConditionalGeneration(MoshiPreTrainedModel, MoshiGenerationMixin):
     config: MoshiConfig
+    # Checkpoints published before the codec moved to `MoshiProcessor` carry Mimi's weights under
+    # `audio_encoder.`. The model no longer holds the codec, so those keys are expected to go unused.
+    _keys_to_ignore_on_load_unexpected = [r"^audio_encoder\."]
     output_modalities = ("audio", "text")
     main_input_name = "input_ids"
     supports_gradient_checkpointing = True
