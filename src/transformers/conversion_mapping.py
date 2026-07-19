@@ -146,7 +146,24 @@ def _build_checkpoint_conversion_mapping():
         # Keyed by class name, not model type: `MoshiModel` and `MoshiForCausalLM` share the `moshi` model type
         # but never had that prefix. `PrefixChange` anchors at the start, so `depth_decoder.*` and
         # `audio_encoder.decoder.*` are left alone.
-        "MoshiForConditionalGeneration": [PrefixChange(prefix_to_remove="decoder")],
+        # The depth decoder used to be a monolithic `MoshiDepthDecoderModel` carrying its own `lm_heads`; it is
+        # now a `MoshiDepthDecoderForCausalLM`, i.e. a `MoshiDepthDecoderModel` under `model` plus the heads.
+        # Everything but `lm_heads` therefore moves one level down.
+        "MoshiForConditionalGeneration": [
+            PrefixChange(prefix_to_remove="decoder"),
+            WeightRenaming(
+                source_patterns=r"depth_decoder\.text_embed_tokens",
+                target_patterns="depth_decoder.model.text_embed_tokens",
+            ),
+            WeightRenaming(
+                source_patterns=r"depth_decoder\.embed_tokens", target_patterns="depth_decoder.model.embed_tokens"
+            ),
+            WeightRenaming(
+                source_patterns=r"depth_decoder\.input_projections",
+                target_patterns="depth_decoder.model.input_projections",
+            ),
+            WeightRenaming(source_patterns=r"depth_decoder\.layers", target_patterns="depth_decoder.model.layers"),
+        ],
         "inkling_mm_model": [
             WeightRenaming(source_patterns=r"model\.llm\.layers", target_patterns=r"model.language_model.layers"),
             WeightRenaming(

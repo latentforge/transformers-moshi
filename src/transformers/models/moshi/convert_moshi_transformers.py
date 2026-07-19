@@ -172,9 +172,15 @@ def _convert_model(
                 state_dict[new_k] = state_dict.pop(k)
 
     # Do the last one by hand
-    state_dict["depth_decoder.text_embed_tokens.weight"] = state_dict.pop(
-        "depth_decoder.model.embed_tokens.weight"
-    )
+    state_dict["depth_decoder.text_embed_tokens.weight"] = state_dict.pop("depth_decoder.model.embed_tokens.weight")
+
+    # The depth decoder is a `MoshiDepthDecoderForCausalLM`: a `MoshiDepthDecoderModel` under `model` plus
+    # `lm_heads`. Everything but the heads therefore lives one level down.
+    for key in list(state_dict.keys()):
+        if key.startswith("depth_decoder.") and not key.startswith("depth_decoder.lm_heads"):
+            new_key = key.replace("depth_decoder.", "depth_decoder.model.", 1)
+            assert new_key not in state_dict, f"would overwrite {new_key}"
+            state_dict[new_key] = state_dict.pop(key)
 
     extra_keys = set(state_dict.keys()) - set(hf_model.state_dict().keys())
     missing_keys = set(hf_model.state_dict().keys()) - set(state_dict.keys())

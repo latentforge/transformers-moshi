@@ -3280,7 +3280,7 @@ class GenerationMixin(ContinuousMixin):
         batch_size_unflattened, cur_len = input_ids.shape[:2]
         batch_size = batch_size_unflattened // num_beams
         # TODO (joao): standardize special cases
-        if self.__class__.__name__ == "MoshiDepthDecoderModel":
+        if self.__class__.__name__ == "MoshiDepthDecoderForCausalLM":
             vocab_size = self.config.audio_vocab_size
         elif self.__class__.__name__ == "ImageGPTForCausalImageModeling":
             vocab_size = self.get_output_embeddings().out_features

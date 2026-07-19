@@ -195,3 +195,8 @@ The original code can be found [here](https://github.com/kyutai-labs/moshi).
 
 [[autodoc]] MoshiDepthDecoderModel
     - forward
+
+## MoshiDepthDecoderForCausalLM
+
+[[autodoc]] MoshiDepthDecoderForCausalLM
+    - forward

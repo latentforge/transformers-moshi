@@ -276,6 +276,7 @@ IGNORE_NON_TESTED = (
         "CsmDepthDecoderModel",  # Building part of bigger (tested) model. Tested implicitly through CsmForConditionalGenerationIntegrationTest.
         "CsmBackboneModel",  # Building part of bigger (tested) model. Tested implicitly through CsmForConditionalGenerationIntegrationTest.
         "MoshiDepthDecoderModel",  # Building part of bigger (tested) model. Tested implicitly through MoshiForConditionalGeneration.
+        "MoshiDepthDecoderForCausalLM",  # Building part of bigger (tested) model. Tested implicitly through MoshiForConditionalGeneration.
         "BltPatcher",  # Building part of bigger (tested) model. Tested implicitly through BLTForCausalLM.
         "BltLocalEncoder",  # Building part of bigger (tested) model. Tested implicitly through BLTForCausalLM.
         "BltLocalDecoder",  # Building part of bigger (tested) model. Tested implicitly through BLTForCausalLM.
@@ -524,6 +525,7 @@ IGNORE_NON_AUTO_CONFIGURED = (
         "CsmDepthDecoderForCausalLM",  # Building part of a bigger model
         "CsmForConditionalGeneration",  # Building part of a bigger model
         "MoshiDepthDecoderModel",  # Building part of a bigger model
+        "MoshiDepthDecoderForCausalLM",  # Building part of a bigger model
         "BltPatcher",  # Building part of a bigger model, tested implicitly through BltForCausalLM
         "Florence2VisionBackbone",  # Building part of a bigger model
         "HiggsAudioV2Model",  # Building part of a bigger model

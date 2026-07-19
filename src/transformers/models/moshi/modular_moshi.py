@@ -543,14 +543,27 @@ class MoshiPreTrainedModel(PreTrainedModel):
             init.normal_(module.weight)
 
 
-class MoshiDepthDecoderModel(MoshiPreTrainedModel, GenerationMixin):
-    """
-    Transformer depth decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`MoshiTransformerLayer`]
+def get_codebook_idx(
+    input_ids: torch.LongTensor | None,
+    inputs_embeds: torch.FloatTensor | None,
+    past_seen_tokens: int,
+) -> torch.Tensor:
+    """Position `i` of the depth decoder's sequence is codebook `i` of a single main-decoder timestep."""
+    sequence = inputs_embeds if inputs_embeds is not None else input_ids
+    return torch.arange(sequence.shape[1], device=sequence.device) + past_seen_tokens
 
-    Args:
-        config: MoshiConfig
-    """
 
+@auto_docstring(
+    custom_intro="""
+    Transformer depth decoder consisting of *config.num_hidden_layers* layers, each one a [`MoshiDecoderLayer`].
+
+    It runs along the codebook axis rather than the time axis: position `i` of its sequence is codebook `i` of a
+    single timestep of the main decoder. It therefore uses neither rotary embeddings nor a final norm, and it
+    embeds its inputs from several sources (a text embedding for the first position, one audio embedding per
+    codebook for the rest, plus a per-codebook projection of the main decoder's hidden state).
+    """
+)
+class MoshiDepthDecoderModel(MoshiPreTrainedModel):
     config: MoshiDepthConfig
 
     def __init__(self, config: MoshiDepthConfig):
@@ -573,7 +586,6 @@ class MoshiDepthDecoderModel(MoshiPreTrainedModel, GenerationMixin):
             ]
         )
 
-        self.lm_heads = MoshiFlexibleLinear(config.hidden_size, config.audio_vocab_size, config.num_codebooks)
         self._attn_implementation = config._attn_implementation
         self.gradient_checkpointing = False
         self.config = config
@@ -586,70 +598,27 @@ class MoshiDepthDecoderModel(MoshiPreTrainedModel, GenerationMixin):
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
-        last_hidden_state: torch.LongTensor | None = None,
+        last_hidden_state: torch.FloatTensor | None = None,
         attention_mask: torch.BoolTensor | None = None,
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         position_ids: torch.LongTensor | None = None,
-        labels: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple | CausalLMOutputWithPast:
-        """
-        Args:
-            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-                Indices of input sequence tokens. The first element of the sequence must the text token associated to the audio codebooks.
-                The rest of the elements must be flatten audio codebooks.
-            last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
-                Sequence of hidden-states at the output of the last layer of the main decoder. Used to contextualize `input_ids`
-            attention_mask (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
-                - 1 for tokens that are **not masked**,
-                - 0 for tokens that are **masked**.
-
-                [What are attention masks?](../glossary#attention-mask)
-
-                Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
-                [`PreTrainedTokenizer.__call__`] for details.
-
-                If `past_key_values` is used, optionally only the last `input_ids` have to be input (see
-                `past_key_values`).
-
-                If you want to change padding behavior, you should read [`modeling_opt._prepare_decoder_attention_mask`]
-                and modify to your needs. See diagram 1 in [the paper](https://huggingface.co/papers/1910.13461) for more
-                information on the default strategy.
-
-                - 1 indicates the head is **not masked**,
-                - 0 indicates the head is **masked**.
-            past_key_values (`Cache`, *optional*):
-                It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
-
-                If `past_key_values` are used, the user can optionally input only the last `input_ids` (those that don't
-                have their past key value states given to this model) of shape `(batch_size, 1)` instead of all `input_ids`
-                of shape `(batch_size, sequence_length)`.
-            inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
-                Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
-                is useful if you want more control over how to convert the inputs into associated vectors than the
-                model's internal embedding lookup matrix.
-            use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
-                `past_key_values`).
-            position_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Indices of positions of each input sequence tokens in the position embeddings. Selected in the range `[0,
-                config.n_positions - 1]`.
-
-                [What are position IDs?](../glossary#position-ids)
-            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
-                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
-                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+    ) -> BaseModelOutputWithPast:
+        r"""
+        input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+            Indices of input sequence tokens. The first element of the sequence must be the text token associated to
+            the audio codebooks. The rest of the elements must be flattened audio codebooks.
+        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the last layer of the main decoder. Used to contextualize
+            `input_ids`.
         """
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
         past_seen_tokens = 0 if past_key_values is None else past_key_values.get_seq_length()
-        codebook_idx = torch.arange(input_ids.shape[1], device=input_ids.device) + past_seen_tokens
+        codebook_idx = get_codebook_idx(input_ids, inputs_embeds, past_seen_tokens)
 
         if position_ids is None:
             position_ids = codebook_idx.unsqueeze(0)
@@ -689,7 +658,71 @@ class MoshiDepthDecoderModel(MoshiPreTrainedModel, GenerationMixin):
                 codebook_idx=codebook_idx,
             )
 
-        logits = self.lm_heads(hidden_states, codebook_idx)
+        return BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=past_key_values)
+
+
+@auto_docstring(
+    custom_intro="""
+    The Moshi depth decoder with a per-codebook audio language modelling head on top.
+    """
+)
+class MoshiDepthDecoderForCausalLM(MoshiPreTrainedModel, GenerationMixin):
+    config: MoshiDepthConfig
+    # `lm_heads` emits audio logits, so it is unrelated to the text embeddings of the backbone.
+    _tied_weights_keys = None
+    _tp_plan = None
+    _pp_plan = None
+
+    def __init__(self, config: MoshiDepthConfig):
+        super().__init__(config)
+        self.model = MoshiDepthDecoderModel(config)
+        self.lm_heads = MoshiFlexibleLinear(config.hidden_size, config.audio_vocab_size, config.num_codebooks)
+
+        self.post_init()
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        last_hidden_state: torch.FloatTensor | None = None,
+        attention_mask: torch.BoolTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        position_ids: torch.LongTensor | None = None,
+        labels: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> CausalLMOutputWithPast:
+        r"""
+        input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+            Indices of input sequence tokens. The first element of the sequence must be the text token associated to
+            the audio codebooks. The rest of the elements must be flattened audio codebooks.
+        last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
+            Sequence of hidden-states at the output of the last layer of the main decoder. Used to contextualize
+            `input_ids`.
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the audio language modeling loss. Indices should either be in
+            `[0, ..., config.audio_vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to
+            `-100` are ignored (masked).
+        """
+        # `lm_heads` is indexed per codebook, so recompute the same indices the backbone uses. This must happen
+        # before the backbone call, which advances `past_key_values`.
+        past_seen_tokens = 0 if past_key_values is None else past_key_values.get_seq_length()
+        codebook_idx = get_codebook_idx(input_ids, inputs_embeds, past_seen_tokens)
+
+        outputs: BaseModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            last_hidden_state=last_hidden_state,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            position_ids=position_ids,
+            **kwargs,
+        )
+
+        logits = self.lm_heads(outputs.last_hidden_state, codebook_idx)
 
         loss = None
         if labels is not None:
@@ -704,7 +737,9 @@ class MoshiDepthDecoderModel(MoshiPreTrainedModel, GenerationMixin):
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=past_key_values,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
         )
 
 
@@ -762,7 +797,7 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, MoshiGenerationMixin):
         self.model = MoshiModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-        self.depth_decoder = MoshiDepthDecoderModel._from_config(config.depth_decoder_config)
+        self.depth_decoder = MoshiDepthDecoderForCausalLM._from_config(config.depth_decoder_config)
 
         self.num_codebooks = config.num_codebooks
         self.post_init()
@@ -984,6 +1019,7 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, MoshiGenerationMixin):
 __all__ = [
     "MoshiConfig",
     "MoshiDepthConfig",
+    "MoshiDepthDecoderForCausalLM",
     "MoshiDepthDecoderModel",
     "MoshiForCausalLM",
     "MoshiForConditionalGeneration",
