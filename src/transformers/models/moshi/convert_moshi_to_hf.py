@@ -375,12 +375,15 @@ if __name__ == "__main__":
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=MoshiConverter(args.tokenizer_vocab_path).converted(),
         chat_template=None,
-        unk_token="<unk>",
         model_input_names=["input_ids", "attention_mask"],
         clean_up_tokenization_spaces=False,
-        bos_token_id=original_tokenizer.bos_id(),
-        eos_token_id=original_tokenizer.eos_id(),
-        pad_token_id=original_tokenizer.pad_id(),
+        # Declared as tokens, not ids: passing `*_token_id` leaves `pad_token_id` and friends unset on the saved
+        # tokenizer, which is why the published checkpoints report `pad_token_id is None` even though `<pad>` is
+        # in their vocabulary.
+        unk_token=original_tokenizer.id_to_piece(original_tokenizer.unk_id()),
+        bos_token=original_tokenizer.id_to_piece(original_tokenizer.bos_id()),
+        eos_token=original_tokenizer.id_to_piece(original_tokenizer.eos_id()),
+        pad_token=original_tokenizer.id_to_piece(original_tokenizer.pad_id()),
     )
 
     processor = MoshiProcessor(

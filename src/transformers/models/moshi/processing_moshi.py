@@ -112,6 +112,25 @@ class MoshiProcessor(ProcessorMixin):
         return_tensors = merged_kwargs["text_kwargs"].get("return_tensors")
         return BatchFeature(data=data, tensor_type=return_tensors)
 
+    def _pad_token_id(self) -> int:
+        """
+        The id used to fill the text stream between enunciations.
+
+        Moshi's published tokenizers carry `<pad>` in their vocabulary but do not declare it as the pad token, so
+        `pad_token_id` is `None` there and the vocabulary is consulted as a fallback. A hit is only trusted when it
+        is not the unknown-token id, since unknown lookups resolve to that.
+        """
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is not None:
+            return pad_id
+        pad_id = self.tokenizer.convert_tokens_to_ids("<pad>")
+        if pad_id is not None and pad_id != self.tokenizer.unk_token_id:
+            return pad_id
+        raise ValueError(
+            "The tokenizer declares no `pad_token_id` and has no `<pad>` in its vocabulary, so the text stream "
+            "cannot be padded to match the audio streams."
+        )
+
     def _pad_text_to_frames(self, input_ids, attention_mask, num_frames: int):
         """Right-pad (or truncate) the text stream so it has one token per audio frame."""
         input_ids = torch.as_tensor(input_ids)
@@ -129,16 +148,14 @@ class MoshiProcessor(ProcessorMixin):
                 "frames). Moshi needs one text token per audio frame, so shorten the text or lengthen the audio."
             )
         if seq_length < num_frames:
-            pad_id = self.tokenizer.pad_token_id
-            if pad_id is None:
-                raise ValueError(
-                    "The tokenizer has no `pad_token_id`, which is needed to align the text stream with the audio "
-                    "streams."
-                )
+            pad_id = self._pad_token_id()
             padding = input_ids.new_full((input_ids.shape[0], num_frames - seq_length), pad_id)
             input_ids = torch.cat([input_ids, padding], dim=-1)
             if attention_mask is not None:
-                attention_mask = torch.cat([attention_mask, torch.zeros_like(padding)], dim=-1)
+                # Attended, not masked out. These frames are not absent tokens: Moshi predicts the text stream
+                # including its padding, and each frame is locked to an audio frame that is itself attended.
+                # Masking them would desynchronise the text stream from the audio it is aligned with.
+                attention_mask = torch.cat([attention_mask, torch.ones_like(padding)], dim=-1)
 
         return input_ids, attention_mask
 
