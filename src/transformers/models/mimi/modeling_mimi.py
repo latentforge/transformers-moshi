@@ -28,7 +28,7 @@ from ...masking_utils import create_sliding_window_causal_mask
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedAudioTokenizerBase
 from ...processing_utils import Unpack
 from ...utils import ModelOutput, TransformersKwargs, auto_docstring, logging
 from ...utils.generic import maybe_autocast
@@ -1146,7 +1146,7 @@ class MimiSplitResidualVectorQuantizer(nn.Module):
 
 
 @auto_docstring
-class MimiPreTrainedModel(PreTrainedModel):
+class MimiPreTrainedModel(PreTrainedAudioTokenizerBase):
     config: MimiConfig
     base_model_prefix = "mimi"
     main_input_name = "input_values"
