@@ -333,6 +333,14 @@ class KyutaiSpeechToTextModelTest(ModelTesterMixin, GenerationTesterMixin, Pipel
     def test_disk_offload_safetensors(self):
         pass
 
+    # The fused audio+text `embed_tokens` is a single `nn.Embedding` of `vocab_size + num_codebooks *
+    # codebook_vocab_size + 1` rows, which is ~98% of this tiny test model. A single embedding is one indivisible
+    # leaf, so it cannot fit under the memory cap the test puts on the first device at any `model_split_percents`;
+    # accelerate then places the whole model on one device, no dispatch happens, and `hf_device_map` is never set.
+    @unittest.skip(reason="The fused audio+text embedding is a single indivisible module holding most of the model.")
+    def test_model_parallelism(self):
+        pass
+
     @pytest.mark.generate
     def test_left_padding_compatibility(self):
         # TODO: this tester has non-standard input monkey-patching in `prepare_config_and_inputs_for_generate`,
