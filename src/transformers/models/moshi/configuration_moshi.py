@@ -21,8 +21,11 @@ from huggingface_hub.dataclasses import strict
 
 from ...configuration_utils import PreTrainedConfig
 from ...modeling_rope_utils import RopeParameters
-from ...utils import auto_docstring
+from ...utils import auto_docstring, logging
 from ..auto import AutoConfig
+
+
+logger = logging.get_logger(__name__)
 
 
 @auto_docstring(checkpoint="kmhf/hf-moshiko")
@@ -64,16 +67,15 @@ class MoshiDepthConfig(PreTrainedConfig):
     num_attention_heads: int = 16
     num_key_value_heads: int | None = None
     audio_vocab_size: int = 2048
-    max_position_embeddings: int = 9
+    max_position_embeddings: int = 17
     hidden_act: str = "silu"
     head_dim: int | None = None
     initializer_range: float = 0.02
     use_cache: bool = True
-    sliding_window: int = 8
     attention_dropout: float | int = 0.0
     ffn_dim: int = 5632
     rms_norm_eps: float = 1e-8
-    num_codebooks: int = 8
+    num_codebooks: int = 16
     tie_word_embeddings: bool = False
     pad_token_id: int | None = None
     bos_token_id: int | None = None
@@ -84,6 +86,15 @@ class MoshiDepthConfig(PreTrainedConfig):
             self.num_key_value_heads if self.num_key_value_heads is not None else self.num_attention_heads
         )
         self.head_dim = self.head_dim or self.hidden_size // self.num_attention_heads
+        # The depth decoder runs along the codebook axis: position 0 holds the text token and positions 1..N hold
+        # the codebooks it predicts, so the number of positions follows from `num_codebooks`.
+        derived_positions = self.num_codebooks + 1
+        if self.max_position_embeddings != derived_positions:
+            logger.warning(
+                f"`max_position_embeddings` is derived from `num_codebooks` for the depth decoder: overriding "
+                f"{self.max_position_embeddings} with {derived_positions} (= `num_codebooks` + 1 for the text token)."
+            )
+            self.max_position_embeddings = derived_positions
         super().__post_init__(**kwargs)
 
     def validate_architecture(self):
@@ -163,7 +174,7 @@ class MoshiConfig(PreTrainedConfig):
     head_dim: int | None = None
     initializer_range: float = 0.02
     use_cache: bool = True
-    sliding_window: int = 3000
+    sliding_window: int | None = 3000
     attention_dropout: float | int = 0.0
     ffn_dim: int = 22528
     rms_norm_eps: float = 1e-8
@@ -197,15 +208,32 @@ class MoshiConfig(PreTrainedConfig):
         if self.depth_decoder_config is None:
             self.depth_decoder_config = {}
         if isinstance(self.depth_decoder_config, dict):
-            self.depth_decoder_config.update(
-                {
-                    "audio_vocab_size": self.audio_vocab_size,
-                    "input_size": self.hidden_size,
-                    "vocab_size": self.vocab_size,
-                    "num_codebooks": self.num_codebooks,
-                }
-            )
+            # These three name the same quantity on both configs, so they are mirrored from the parent. A
+            # conflicting value used to be overwritten silently, which hid genuine misconfiguration.
+            mirrored = {
+                "audio_vocab_size": self.audio_vocab_size,
+                "input_size": self.hidden_size,
+                "vocab_size": self.vocab_size,
+            }
+            for key, parent_value in mirrored.items():
+                given = self.depth_decoder_config.get(key)
+                if given is not None and given != parent_value:
+                    parent_name = "hidden_size" if key == "input_size" else key
+                    logger.warning(
+                        f"`depth_decoder_config['{key}']={given}` conflicts with `{parent_name}={parent_value}` and "
+                        f"is overridden with {parent_value}. The depth decoder consumes the main decoder's hidden "
+                        "states and codebooks, so the two must agree."
+                    )
+            self.depth_decoder_config.update(mirrored)
+            # `num_codebooks` is deliberately not mirrored: it does not mean the same thing on both configs. On the
+            # parent it is the number of codebooks *per audio stream*; on the depth decoder it is how many
+            # codebooks are *predicted* (`dep_q` upstream, versus `n_q = 2 * num_codebooks` in total). They happen
+            # to coincide in the released checkpoints, which predict only Moshi's own stream because the user-side
+            # heads were dropped, but a model trained to predict both streams has twice as many. So the parent's
+            # value is only a default here.
+            self.depth_decoder_config.setdefault("num_codebooks", 2 * self.num_codebooks)
             self.depth_decoder_config = MoshiDepthConfig(**self.depth_decoder_config)
+
         super().__post_init__(**kwargs)
 
     def validate_architecture(self):

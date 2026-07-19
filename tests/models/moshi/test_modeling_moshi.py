@@ -45,7 +45,6 @@ from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import (
     TEST_EAGER_MATCHES_SDPA_INFERENCE_PARAMETERIZATION,
     ModelTesterMixin,
-    floats_tensor,
     ids_tensor,
 )
 from ...test_pipeline_mixin import PipelineTesterMixin
@@ -465,14 +464,14 @@ class MoshiTester:
 
         input_ids = ids_tensor([batch_size, self.seq_length], self.vocab_size)
 
-        moshi_audio_codes = ids_tensor([batch_size, self.num_codebooks, self.seq_length], self.mimi_codebook_size)
+        assistant_audio_codes = ids_tensor([batch_size, self.num_codebooks, self.seq_length], self.mimi_codebook_size)
         user_audio_codes = ids_tensor([batch_size, self.num_codebooks, self.seq_length], self.mimi_codebook_size)
         attention_mask = input_ids.ne(self.pad_token_id)
 
         config = self.get_config()
         inputs_dict = {
             "input_ids": input_ids,
-            "moshi_audio_codes": moshi_audio_codes,
+            "assistant_audio_codes": assistant_audio_codes,
             "user_audio_codes": user_audio_codes,
             "attention_mask": attention_mask,
         }
@@ -530,6 +529,16 @@ class MoshiTester:
         return config, inputs_dict
 
 
+def _extend_user_stream(inputs_dict, num_codebooks, extra_frames=64):
+    """Moshi consumes a user frame per generated step, so the stream has to reach the end of the horizon."""
+    codes = inputs_dict.get("user_audio_codes")
+    if codes is None:
+        return inputs_dict
+    padding = codes.new_zeros((codes.shape[0], num_codebooks, extra_frames))
+    inputs_dict["user_audio_codes"] = torch.cat([codes, padding], dim=2)
+    return inputs_dict
+
+
 @require_torch
 class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
     all_model_classes = (MoshiForConditionalGeneration,) if is_torch_available() else ()
@@ -538,7 +547,7 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
     # ``MoshiForConditionalGeneration.forward`` requires audio codes alongside ``input_ids``;
     # ``test_flex_attention_with_grads`` (and any other test that builds inputs via
     # ``main_input_name`` + ``additional_model_inputs``) needs these to be listed here.
-    additional_model_inputs = ["moshi_audio_codes", "user_audio_codes", "attention_mask"]
+    additional_model_inputs = ["assistant_audio_codes", "user_audio_codes", "attention_mask"]
 
     def setUp(self):
         self.model_tester = MoshiTester(self)
@@ -560,24 +569,22 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
         input_ids = inputs_dict.pop("input_ids").to(torch_device)
         attention_mask = inputs_dict.pop("attention_mask").to(torch_device)
 
-        # Make sure we only return `input_ids`.
-        # Note that audio_codes will still be generated internally, so the ability to test audio codes is still there.
-        # There are further tests to test that audio waveforms and codes are well generated.
-        inputs_dict["return_audio_waveforms"] = False
+        # Make sure we only return `input_ids`. Audio codes are still generated internally, so the tests below
+        # can still exercise them.
         inputs_dict["return_audio_codes"] = False
         inputs_dict["concat_unconditional_inputs"] = False
+        _extend_user_stream(inputs_dict, config.num_codebooks)
 
         return config, input_ids, attention_mask, inputs_dict
 
     def prepare_config_and_inputs_for_generate(self, batch_size=2):
         config, filtered_inputs_dict = super().prepare_config_and_inputs_for_generate(batch_size=batch_size)
 
-        # Make sure we only return `input_ids`.
-        # Note that audio_codes will still be generated internally, so the ability to test audio codes is still there.
-        # There are further tests to test that audio waveforms and codes are well generated.
-        filtered_inputs_dict["return_audio_waveforms"] = False
+        # Make sure we only return `input_ids`. Audio codes are still generated internally, so the tests below
+        # can still exercise them.
         filtered_inputs_dict["return_audio_codes"] = False
         filtered_inputs_dict["concat_unconditional_inputs"] = False
+        _extend_user_stream(filtered_inputs_dict, config.num_codebooks)
 
         return config, filtered_inputs_dict
 
@@ -608,22 +615,24 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
         # Overwrite -- Moshi needs to prepare the audio codes, and they must be padded accordingly
         config, inputs_dict = self.prepare_config_and_inputs_for_generate()
         input_ids = inputs_dict["input_ids"]
-        moshi_audio_codes = inputs_dict["moshi_audio_codes"]
-        user_audio_codes = inputs_dict["user_audio_codes"]
+        assistant_audio_codes = inputs_dict["assistant_audio_codes"]
+        # This test also runs `forward`, which requires the two audio streams to line up exactly, so trim the user
+        # stream back to the prompt (`prepare_config_and_inputs_for_generate` extends it for `generate`).
+        user_audio_codes = inputs_dict["user_audio_codes"][..., : assistant_audio_codes.shape[-1]]
 
         pad_size = (input_ids.shape[0], 32)
         padding = (
             torch.ones((pad_size[0], self.model_tester.num_codebooks, 32), dtype=input_ids.dtype, device=torch_device)
             * config.audio_vocab_size
         )
-        padded_moshi_audio_codes = torch.cat((padding, moshi_audio_codes), dim=2)
+        padded_assistant_audio_codes = torch.cat((padding, assistant_audio_codes), dim=2)
         padded_user_audio_codes = torch.cat((padding, user_audio_codes), dim=2)
 
         # the audio codes are randomly generated in `prepare_config_and_inputs_for_generate`, and they must match
         # their padded version for the test to be valid -- we need to pass both
-        unpadded_custom_inputs = {"moshi_audio_codes": moshi_audio_codes, "user_audio_codes": user_audio_codes}
+        unpadded_custom_inputs = {"assistant_audio_codes": assistant_audio_codes, "user_audio_codes": user_audio_codes}
         padded_custom_inputs = {
-            "moshi_audio_codes": padded_moshi_audio_codes,
+            "assistant_audio_codes": padded_assistant_audio_codes,
             "user_audio_codes": padded_user_audio_codes,
         }
         super().test_left_padding_compatibility(
@@ -692,7 +701,7 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
                 )
 
                 torch.testing.assert_close(res_eager.sequences, res_sdpa.sequences)
-                torch.testing.assert_close(res_eager.audio_sequences, res_sdpa.audio_sequences)
+                torch.testing.assert_close(res_eager.audio_codes, res_sdpa.audio_codes)
 
     @pytest.mark.generate
     def test_generate_without_input_ids(self):
@@ -703,7 +712,9 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
             model.eval()
 
             output_ids_generate = model.generate(
-                do_sample=False, max_new_tokens=self.max_new_tokens, remove_invalid_values=True
+                do_sample=False,
+                max_new_tokens=self.max_new_tokens,
+                remove_invalid_values=True,
             )
             print(output_ids_generate)
             self.assertIsNotNone(output_ids_generate)
@@ -727,35 +738,6 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
     def test_training_gradient_checkpointing_use_reentrant_true(self):
         super().test_training_gradient_checkpointing_use_reentrant_true()
 
-    def test_generate_from_input_values(self):
-        for model_class in self.all_generative_model_classes:
-            config, input_ids, _, _ = self._get_input_ids_and_config()
-
-            model = model_class(config).to(torch_device).eval()
-
-            input_values_length = int(
-                self.model_tester.seq_length * config.sampling_rate / config.audio_encoder_config.frame_rate
-            )
-
-            user_input_values = floats_tensor((input_ids.shape[0], 1, input_values_length))
-            moshi_input_values = floats_tensor((input_ids.shape[0], 1, input_values_length))
-
-            user_audio_codes = model.audio_encoder.encode(user_input_values, num_quantizers=model.num_codebooks)[0]
-            moshi_audio_codes = model.audio_encoder.encode(moshi_input_values, num_quantizers=model.num_codebooks)[0]
-
-            outputs_from_audio_codes = model.generate(
-                input_ids, max_new_tokens=5, user_audio_codes=user_audio_codes, moshi_audio_codes=moshi_audio_codes
-            )
-
-            outputs_from_audio_values = model.generate(
-                input_ids, max_new_tokens=5, user_input_values=user_input_values, moshi_input_values=moshi_input_values
-            )
-
-            self.assertTrue((outputs_from_audio_values.sequences == outputs_from_audio_codes.sequences).all())
-            self.assertTrue(
-                torch.allclose(outputs_from_audio_codes.audio_sequences, outputs_from_audio_values.audio_sequences)
-            )
-
     def test_generate_depth_decoder_kwargs(self):
         # test sampling and beam search
         for model_class in self.all_generative_model_classes:
@@ -778,19 +760,21 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
 
             # check bs>1
             model.generate(
-                **model.get_unconditional_inputs(num_samples=4), max_new_tokens=5, concat_unconditional_inputs=False
+                **model.get_unconditional_inputs(num_samples=4, num_user_frames=6),
+                max_new_tokens=5,
+                concat_unconditional_inputs=False,
             )
 
             # check same results from unconditional or no inputs
             outputs_from_unconditional = model.generate(
-                **model.get_unconditional_inputs(num_samples=1), max_new_tokens=5, concat_unconditional_inputs=False
+                **model.get_unconditional_inputs(num_samples=1, num_user_frames=6),
+                max_new_tokens=5,
+                concat_unconditional_inputs=False,
             )
             outputs_from_none = model.generate(max_new_tokens=5)
 
             self.assertTrue((outputs_from_unconditional.sequences == outputs_from_none.sequences).all())
-            self.assertTrue(
-                torch.allclose(outputs_from_unconditional.audio_sequences, outputs_from_none.audio_sequences)
-            )
+            self.assertTrue(torch.allclose(outputs_from_unconditional.audio_codes, outputs_from_none.audio_codes))
 
     @unittest.skip(reason="Compile not yet supported because in Moshi models")
     def test_sdpa_can_dispatch_on_flash(self):
@@ -869,7 +853,7 @@ class MoshiIntegrationTests(unittest.TestCase):
         )
 
         # fmt: off
-        moshi_audio_codes = [[[1049, 127, 1880, 972, 972, 1156, 1913, 415, 1933],
+        assistant_audio_codes = [[[1049, 127, 1880, 972, 972, 1156, 1913, 415, 1933],
                               [1700, 243, 91, 91, 91, 745, 1478, 638, 57],
                               [1626, 457, 457, 457, 457, 1839, 200, 2011, 1142],
                               [546, 290, 390, 390, 290, 1408, 1812, 1187, 1911],
@@ -879,12 +863,12 @@ class MoshiIntegrationTests(unittest.TestCase):
                               [2008, 1744, 1511, 568, 1533, 550, 237, 1412, 1401]]]
         # fmt: on
 
-        moshi_audio_codes = torch.tensor(moshi_audio_codes, device=torch_device)
-        user_audio_codes = user_audio_codes[:, :, : moshi_audio_codes.shape[-1]]
+        assistant_audio_codes = torch.tensor(assistant_audio_codes, device=torch_device)
+        user_audio_codes = user_audio_codes[:, :, : assistant_audio_codes.shape[-1]]
 
         model_outputs = model.generate(
             user_audio_codes=user_audio_codes,
-            moshi_audio_codes=moshi_audio_codes,
+            assistant_audio_codes=assistant_audio_codes,
             input_ids=input_ids,
             do_sample=False,
             depth_decoder_do_sample=False,

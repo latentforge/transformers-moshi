@@ -32,7 +32,7 @@ from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
 from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
-from ...masking_utils import create_causal_mask
+from ...masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, ModelOutput
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
@@ -41,7 +41,6 @@ from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
-from ..auto.modeling_auto import AutoModel
 from .configuration_moshi import MoshiConfig, MoshiDepthConfig
 from .generation_moshi import MoshiGenerationMixin
 
@@ -410,7 +409,6 @@ class MoshiDecoderLayer(GradientCheckpointingLayer):
         self.input_layernorm = MoshiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = MoshiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.use_flexible_linear = use_flexible_linear
-        self.sliding_window = config.sliding_window
         self._attn_implementation = config._attn_implementation
 
     def forward(
@@ -456,7 +454,7 @@ class MoshiPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     input_modalities = ("audio", "text")
     supports_gradient_checkpointing = True
-    _no_split_modules = ["MoshiDecoderLayer", "MimiTransformerLayer"]
+    _no_split_modules = ["MoshiDecoderLayer"]
     _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = True
@@ -713,7 +711,7 @@ class MoshiModel(MoshiPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if inputs_embeds is None:
-            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+            inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
@@ -723,7 +721,8 @@ class MoshiModel(MoshiPreTrainedModel):
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
+        mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
+        causal_mask = mask_function(
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -738,17 +737,16 @@ class MoshiModel(MoshiPreTrainedModel):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
-                position_embeddings=position_embeddings,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
+                position_embeddings=position_embeddings,
                 **kwargs,
             )
-
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
+            past_key_values=past_key_values if use_cache else None,
         )
 
 
@@ -857,7 +855,6 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, MoshiGenerationMixin):
         self.embed_tokens = nn.ModuleList(
             [nn.Embedding(config.audio_vocab_size + 1, config.hidden_size) for _ in range(2 * config.num_codebooks)]
         )
-        self.audio_encoder = AutoModel.from_config(config.audio_encoder_config)
         self.model = MoshiModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -875,10 +872,8 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, MoshiGenerationMixin):
         self,
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.BoolTensor | None = None,
-        user_input_values: torch.FloatTensor | None = None,
         user_audio_codes: torch.Tensor | None = None,
-        moshi_input_values: torch.FloatTensor | None = None,
-        moshi_audio_codes: torch.Tensor | None = None,
+        assistant_audio_codes: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         text_labels: torch.LongTensor | None = None,
@@ -889,14 +884,10 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, MoshiGenerationMixin):
         **kwargs,
     ) -> MoshiConditionalGenerationOutputWithPast:
         r"""
-        user_input_values (`torch.Tensor `of shape `(batch_size, 1, audio_sequence_length), *optional*):
-            The audio waveforms used as audio user prompt for the generation.
         user_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
-            The audio codes used as audio user prompt for the generation. Has priority over `user_input_values` and represents the audio "tokens" of `user_input_values` once passed through the audio encoder.
-        moshi_input_values (`torch.Tensor `of shape `(batch_size, 1, audio_sequence_length), *optional*):
-            The audio waveforms used as audio Moshi prompt for the generation.
-        moshi_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
-            The audio codes used as audio Moshi prompt for the generation. Has priority over `moshi_input_values` and represents the audio "tokens" of `moshi_input_values` once passed through the audio encoder.
+            The audio codes used as audio user prompt for the generation, as produced by [`MoshiProcessor`].
+        assistant_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
+            The audio codes used as audio Moshi prompt for the generation, as produced by [`MoshiProcessor`].
         inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
             Optionally, instead of passing `input_ids` you can choose to directly pass an embedded
             representation. If `past_key_values` is used, optionally only the last `inputs_embeds` have to be
@@ -933,12 +924,6 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, MoshiGenerationMixin):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
-        kwargs_audio_encoder = {
-            argument[len("audio_encoder_")]: value
-            for argument, value in kwargs.items()
-            if argument.startswith("audio_encoder_")
-        }
-
         kwargs_decoder = {
             argument[len("decoder_") :]: value for argument, value in kwargs.items() if argument.startswith("decoder_")
         }
@@ -951,30 +936,16 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, MoshiGenerationMixin):
 
         # If inputs_embeds is provided, it has the priority over input_ids and audio_codes, which won't be used
         if inputs_embeds is None:
-            if user_input_values is not None and user_audio_codes is None:
-                user_audio_codes = self.audio_encoder.encode(
-                    user_input_values, num_quantizers=self.num_codebooks, **kwargs_audio_encoder
-                )[0]
-
-            if moshi_input_values is not None and moshi_audio_codes is None:
-                moshi_audio_codes = self.audio_encoder.encode(
-                    moshi_input_values, num_quantizers=self.num_codebooks, **kwargs_audio_encoder
-                )[0]
-
-            audio_codes = torch.cat([moshi_audio_codes, user_audio_codes], dim=1)
+            audio_codes = torch.cat([assistant_audio_codes, user_audio_codes], dim=1)
 
             if input_ids is None and audio_codes is None:
-                raise ValueError(
-                    "You must provide at least one of `input_ids`, `inputs_embeds`, `input_values` and `audio_codes`."
-                )
+                raise ValueError("You must provide at least one of `input_ids`, `inputs_embeds` and the audio codes.")
 
             if input_ids is not None:
                 inputs_embeds = self.model.embed_tokens(input_ids)
 
             if audio_codes is not None:
-                audio_inputs_embeds = sum(
-                    self.embed_tokens[codebook](audio_codes[:, codebook]) for codebook in range(audio_codes.shape[1])
-                )
+                audio_inputs_embeds = self._embed_audio_codes(audio_codes)
                 inputs_embeds = (
                     audio_inputs_embeds
                     if inputs_embeds is None
@@ -1062,14 +1033,6 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, MoshiGenerationMixin):
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
-
-    def freeze_audio_encoder(self):
-        """
-        Freeze the audio encoder weights.
-        """
-        for param in self.audio_encoder.parameters():
-            param.requires_grad = False
-        self.audio_encoder._requires_grad = False
 
     def freeze_depth_decoder(self):
         """

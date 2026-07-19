@@ -65,7 +65,7 @@ It's the audio encoder from Kyutai, that has recently been integrated to transfo
 
 ## Tips
 
-The original checkpoints can be converted using the conversion script `src/transformers/models/moshi/convert_moshi_transformers.py`
+The original checkpoints can be converted using the conversion script `src/transformers/models/moshi/convert_moshi_to_hf.py`
 
 ### How to use the model
 
@@ -87,14 +87,16 @@ Moshi is a streaming auto-regressive model with two streams of audio. To put it 
 [`MoshiForConditionalGeneration.generate`] thus needs 3 inputs:
 
 1. `input_ids` - corresponding to the text token history
-2. `moshi_input_values` or `moshi_audio_codes`- corresponding to the model audio history
-3. `user_input_values` or `user_audio_codes` - corresponding to the user audio history
+2. `assistant_audio_codes` - corresponding to the model audio history
+3. `user_audio_codes` - corresponding to the user audio history
+
+Audio codes are produced by [`MoshiProcessor`], which owns the Mimi codec. The model itself only ever sees codes.
 
 These three inputs must be synchronized. Meaning that their lengths must correspond to the same number of tokens.
 
 You can dynamically use the 3 inputs depending on what you want to test:
 
-1. Simply check the model response to an user prompt - in that case, `input_ids` can be filled with pad tokens and `user_input_values` can be a zero tensor of the same shape than the user prompt.
+1. Simply check the model response to an user prompt - in that case, `input_ids` can be filled with pad tokens and `user_audio_codes` can be the codes for silence, from [`MoshiProcessor.get_blank_user_audio_codes`].
 2. Test more complex behaviour - in that case, you must be careful about how the input tokens are synchronized with the audios.
 
 <Tip>
@@ -117,31 +119,41 @@ import math
 import torch
 from datasets import Audio, load_dataset
 
-from transformers import AutoFeatureExtractor, AutoTokenizer
+from transformers import AutoProcessor, MoshiForConditionalGeneration
 
 
-librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
-feature_extractor = AutoFeatureExtractor.from_pretrained("kyutai/moshiko-pytorch-bf16")
-tokenizer = AutoTokenizer.from_pretrained("kyutai/moshiko-pytorch-bf16")
+device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16
 
-# prepare user input audio
-librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=feature_extractor.sampling_rate))
-audio_sample = librispeech_dummy[-1]["audio"]["array"]
-user_input_values = feature_extractor(raw_audio=audio_sample, sampling_rate=feature_extractor.sampling_rate, return_tensors="pt").to(device=device, dtype=dtype)
+processor = AutoProcessor.from_pretrained("kyutai/moshiko-pytorch-bf16")
+model = MoshiForConditionalGeneration.from_pretrained("kyutai/moshiko-pytorch-bf16", dtype=dtype).to(device)
 
-# prepare moshi input values - we suppose moshi didn't say anything while the user spoke
-moshi_input_values = torch.zeros_like(user_input_values.input_values)
+# prepare user input audio
+librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+sampling_rate = processor.feature_extractor.sampling_rate
+librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=sampling_rate))
+audio_sample = librispeech_dummy[-1]["audio"]["array"]
+
+# we suppose moshi didn't say anything while the user spoke, so its stream is silence
+inputs = processor(audio=audio_sample, sampling_rate=sampling_rate).to(device=device)
+user_audio_codes = inputs.user_audio_codes
+assistant_audio_codes = processor.get_blank_user_audio_codes(user_audio_codes.shape[0]).to(device)
+assistant_audio_codes = assistant_audio_codes.expand(-1, -1, user_audio_codes.shape[-1])
 
 # prepare moshi input ids - we suppose moshi didn't say anything while the user spoke
-num_tokens = math.ceil(moshi_input_values.shape[-1] * waveform_to_token_ratio)
-input_ids = torch.ones((1, num_tokens), device=device, dtype=torch.int64) * tokenizer.encode("<pad>")[0]
+input_ids = torch.ones((1, user_audio_codes.shape[-1]), device=device, dtype=torch.int64)
+input_ids = input_ids * processor.tokenizer.encode("<pad>")[0]
 
 # generate 25 new tokens (around 2s of audio)
-output = model.generate(input_ids=input_ids, user_input_values=user_input_values.input_values, moshi_input_values=moshi_input_values, max_new_tokens=25)
+output = model.generate(
+    input_ids=input_ids,
+    user_audio_codes=user_audio_codes,
+    assistant_audio_codes=assistant_audio_codes,
+    max_new_tokens=25,
+)
 
 text_tokens = output.sequences
-audio_waveforms = output.audio_sequences
+audio_waveforms = processor.decode_audio(output.audio_codes)
 ```
 
 **2. Model training**
@@ -183,6 +195,11 @@ The original code can be found [here](https://github.com/kyutai-labs/moshi).
 
 [[autodoc]] MoshiForCausalLM
     - forward
+
+## MoshiProcessor
+
+[[autodoc]] MoshiProcessor
+    - __call__
 
 ## MoshiForConditionalGeneration
 

@@ -13,7 +13,6 @@
 # limitations under the License.
 """Generation logic for the Moshi model."""
 
-import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,7 +21,6 @@ import torch
 from ...cache_utils import Cache
 from ...generation import GenerationConfig, GenerationMixin
 from ...modeling_outputs import ModelOutput
-from ...utils import ModelOutput as _ModelOutput  # noqa: F401
 from ...utils import auto_docstring, logging
 
 
@@ -37,8 +35,6 @@ logger = logging.get_logger(__name__)
 @dataclass
 class MoshiConditionalGenerationGenerateOutput(ModelOutput):
     r"""
-    audio_sequences (`torch.LongTensor` of shape `(batch_size*num_return_sequences, 1, sequence_length)`, *optional*):
-        The generated audio waveforms.
     sequences (`torch.LongTensor` of shape `(batch_size*num_return_sequences, sequence_length)`):
         The generated text sequences. The second dimension (sequence_length) is either equal to `max_length` or shorter
         if all batches finished early due to the `eos_token_id`.
@@ -66,10 +62,9 @@ class MoshiConditionalGenerationGenerateOutput(ModelOutput):
         Contains the model cache, used to speed up decoding. Different models have a different cache format, check
         the model's documentation. Usually, a [`~cache_utils.Cache`] instance.
     audio_codes (`torch.LongTensor` of shape `(batch_size*num_return_sequences, num_codeooks, sequence_length)`, *optional*):
-        The generated audio codes. Returned if `return_audio_codes=True`. Intermediate audio "tokens" which transforms to `audio_sequences` once passed through the audio decoder.
+        The generated audio codes. Returned if `return_audio_codes=True`. Turn them into a waveform with [`MoshiProcessor.decode_audio`].
     """
 
-    audio_sequences: torch.Tensor | None = None
     sequences: torch.LongTensor | None = None
     sequences_scores: torch.FloatTensor | None = None
     scores: tuple[torch.FloatTensor] | None = None
@@ -88,9 +83,9 @@ class MoshiUnconditionalInput(ModelOutput):
     input_ids (`torch.Tensor `of shape `(batch_size, sequence_length), *optional*):
         The sequence used as a text prompt for the generation.
     user_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
-        The audio codes used as audio user prompt for the generation. Has priority over `user_input_values` and represents the audio "tokens" of `user_input_values` once passed through the audio encoder.
-    moshi_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
-        The audio codes used as audio Moshi prompt for the generation. Has priority over `moshi_input_values` and represents the audio "tokens" of `moshi_input_values` once passed through the audio encoder.
+        The audio codes used as audio user prompt for the generation, as produced by [`MoshiProcessor`].
+    assistant_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
+        The audio codes used as audio Moshi prompt for the generation, as produced by [`MoshiProcessor`].
     attention_mask (`torch.LongTensor`)  of shape `(batch_size, sequence_length)`, *optional*):
         Attention mask to avoid performing attention on padding token indices. Mask values selected in `[0,
         1]`: 1 for tokens that are **not masked**, 0 for tokens that are **masked**.
@@ -98,7 +93,7 @@ class MoshiUnconditionalInput(ModelOutput):
 
     input_ids: torch.LongTensor | None = None
     user_audio_codes: torch.Tensor | None = None
-    moshi_audio_codes: torch.Tensor | None = None
+    assistant_audio_codes: torch.Tensor | None = None
     attention_mask: torch.LongTensor | None = None
 
 
@@ -113,13 +108,24 @@ class MoshiGenerationMixin(GenerationMixin):
     time for generation (`forward` reuses `build_delay_pattern_mask` through the MRO).
     """
 
+    def _embed_audio_codes(self, audio_codes: torch.Tensor, offset: int = 0) -> torch.Tensor:
+        """
+        Sum the per-codebook audio embeddings.
+
+        `embed_tokens` is a `ModuleList`, so under a device map its entries can land on different devices. Each
+        embedding's output is therefore moved to a single device before summing.
+        """
+        target_device = self.embed_tokens[offset].weight.device
+        return sum(
+            self.embed_tokens[codebook + offset](audio_codes[:, codebook]).to(target_device)
+            for codebook in range(audio_codes.shape[1])
+        )
+
     def _prepare_inputs_embeds_for_generation(
         self,
         input_ids: torch.LongTensor | None = None,
-        user_input_values: torch.FloatTensor | None = None,
         user_audio_codes: torch.Tensor | None = None,
-        moshi_input_values: torch.FloatTensor | None = None,
-        moshi_audio_codes: torch.Tensor | None = None,
+        assistant_audio_codes: torch.Tensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         generation_config: GenerationConfig | None = None,
@@ -127,31 +133,18 @@ class MoshiGenerationMixin(GenerationMixin):
         concat_unconditional_inputs: bool = False,
     ):
         user_delay_pattern_mask = None
-        moshi_delay_pattern_mask = None
+        assistant_delay_pattern_mask = None
 
-        if (
-            inputs_embeds is None
-            and input_ids is None
-            and user_input_values is None
-            and user_audio_codes is None
-            and moshi_input_values is None
-            and moshi_audio_codes is None
-        ):
+        if inputs_embeds is None and input_ids is None and user_audio_codes is None and assistant_audio_codes is None:
             raise ValueError(
-                "You must provide at least one of `input_ids`, `user_input_values`, `moshi_input_values`, `user_audio_codes`, `moshi_audio_codes` or `inputs_embeds`."
+                "You must provide at least one of `input_ids`, `user_audio_codes`, `assistant_audio_codes` or `inputs_embeds`."
             )
-
-        # in case inputs_embeds is passed, we might still need to create delay pattern masks
-        if inputs_embeds is None or apply_delay_pattern_mask:
-            if user_input_values is not None and user_audio_codes is None:
-                user_audio_codes = self.audio_encoder.encode(user_input_values, num_quantizers=self.num_codebooks)[0]
-
-            if moshi_input_values is not None and moshi_audio_codes is None:
-                moshi_audio_codes = self.audio_encoder.encode(moshi_input_values, num_quantizers=self.num_codebooks)[0]
 
         if inputs_embeds is None and concat_unconditional_inputs:
             unconditional_inputs = self.get_unconditional_inputs(num_samples=user_audio_codes.shape[0])
-            moshi_audio_codes = torch.cat([unconditional_inputs.moshi_audio_codes, moshi_audio_codes], dim=2)
+            assistant_audio_codes = torch.cat(
+                [unconditional_inputs.assistant_audio_codes, assistant_audio_codes], dim=2
+            )
             user_audio_codes = torch.cat([unconditional_inputs.user_audio_codes, user_audio_codes], dim=2)
             input_ids = torch.cat([unconditional_inputs.input_ids, input_ids], dim=1)
             if attention_mask is not None:
@@ -166,9 +159,9 @@ class MoshiGenerationMixin(GenerationMixin):
                     max_length=generation_config.max_length,
                 )
 
-            if apply_delay_pattern_mask and moshi_audio_codes is not None:
-                moshi_audio_codes, moshi_delay_pattern_mask = self.build_delay_pattern_mask(
-                    moshi_audio_codes,
+            if apply_delay_pattern_mask and assistant_audio_codes is not None:
+                assistant_audio_codes, assistant_delay_pattern_mask = self.build_delay_pattern_mask(
+                    assistant_audio_codes,
                     bos_token_id=self.config.audio_vocab_size,
                     pad_token_id=self.config.audio_vocab_size,
                     max_length=generation_config.max_length,
@@ -176,23 +169,32 @@ class MoshiGenerationMixin(GenerationMixin):
 
         # If inputs_embeds is provided, it has the priority over input_ids and audio_codes, which won't be used
         if inputs_embeds is None:
+            # The user stream may run ahead of the prompt (the caller can hand over future frames up front). Only
+            # the part that lines up with the text and assistant streams belongs in the prompt embeddings; the rest
+            # is consumed one frame at a time by the generation loop, through `user_delay_pattern_mask`.
+            if user_audio_codes is not None and assistant_audio_codes is not None:
+                prompt_length = assistant_audio_codes.shape[-1]
+                if user_audio_codes.shape[-1] > prompt_length:
+                    user_audio_codes = user_audio_codes[..., :prompt_length]
+            # The two streams can reach here from different places (caller inputs vs `get_unconditional_inputs`),
+            # and under a device map those are not necessarily the same device. Line them up with the embeddings
+            # that are about to consume them.
+            codes_device = self.embed_tokens[0].weight.device
+            if user_audio_codes is not None:
+                user_audio_codes = user_audio_codes.to(codes_device)
+            if assistant_audio_codes is not None:
+                assistant_audio_codes = assistant_audio_codes.to(codes_device)
+
             audio_inputs_embeds = None
-            if user_audio_codes is not None and moshi_audio_codes is not None:
-                audio_codes = torch.cat([moshi_audio_codes, user_audio_codes], dim=1)
-                audio_inputs_embeds = sum(
-                    self.embed_tokens[codebook](audio_codes[:, codebook]) for codebook in range(audio_codes.shape[1])
-                )
-            elif moshi_audio_codes is not None:
-                audio_codes = moshi_audio_codes
-                audio_inputs_embeds = sum(
-                    self.embed_tokens[codebook](audio_codes[:, codebook]) for codebook in range(audio_codes.shape[1])
-                )
+            if user_audio_codes is not None and assistant_audio_codes is not None:
+                audio_codes = torch.cat([assistant_audio_codes, user_audio_codes], dim=1)
+                audio_inputs_embeds = self._embed_audio_codes(audio_codes)
+            elif assistant_audio_codes is not None:
+                audio_codes = assistant_audio_codes
+                audio_inputs_embeds = self._embed_audio_codes(audio_codes)
             elif user_audio_codes is not None:
                 audio_codes = user_audio_codes
-                audio_inputs_embeds = sum(
-                    self.embed_tokens[codebook](audio_codes[:, codebook + self.num_codebooks])
-                    for codebook in range(audio_codes.shape[1])
-                )
+                audio_inputs_embeds = self._embed_audio_codes(audio_codes, offset=self.num_codebooks)
 
             if input_ids is not None:
                 inputs_embeds = self.model.embed_tokens(input_ids)
@@ -208,9 +210,9 @@ class MoshiGenerationMixin(GenerationMixin):
             inputs_embeds,
             input_ids,
             user_audio_codes,
-            moshi_audio_codes,
+            assistant_audio_codes,
             user_delay_pattern_mask,
-            moshi_delay_pattern_mask,
+            assistant_delay_pattern_mask,
             attention_mask,
         )
 
@@ -218,13 +220,10 @@ class MoshiGenerationMixin(GenerationMixin):
     def generate(
         self,
         input_ids: torch.LongTensor | None = None,
-        user_input_values: torch.FloatTensor | None = None,
         user_audio_codes: torch.Tensor | None = None,
-        moshi_input_values: torch.FloatTensor | None = None,
-        moshi_audio_codes: torch.Tensor | None = None,
+        assistant_audio_codes: torch.Tensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
-        return_audio_waveforms: bool | None = True,
-        return_audio_codes: bool | None = None,
+        return_audio_codes: bool | None = True,
         concat_unconditional_inputs: bool | None = True,
         **kwargs,
     ) -> torch.LongTensor:
@@ -234,21 +233,15 @@ class MoshiGenerationMixin(GenerationMixin):
         Parameters:
             input_ids (`torch.Tensor `of shape `(batch_size, sequence_length), *optional*):
                 The sequence used as a text prompt for the generation.
-            user_input_values (`torch.Tensor `of shape `(batch_size, 1, audio_sequence_length), *optional*):
-                The audio waveforms used as audio user prompt for the generation.
             user_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
-                The audio codes used as audio user prompt for the generation. Has priority over `user_input_values` and represents the audio "tokens" of `user_input_values` once passed through the audio encoder.
-            moshi_input_values (`torch.Tensor `of shape `(batch_size, 1, audio_sequence_length), *optional*):
-                The audio waveforms used as audio Moshi prompt for the generation.
-            moshi_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
-                The audio codes used as audio Moshi prompt for the generation. Has priority over `moshi_input_values` and represents the audio "tokens" of `moshi_input_values` once passed through the audio encoder.
+                The audio codes used as audio user prompt for the generation, as produced by [`MoshiProcessor`].
+            assistant_audio_codes (`torch.Tensor `of shape `(batch_size, num_codebooks, sequence_length), *optional*):
+                The audio codes used as audio Moshi prompt for the generation, as produced by [`MoshiProcessor`].
             inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
                 Optionally, instead of passing `input_ids` and the audio inputs you can choose to directly pass an embedded representation. This
                 is useful if you want more control over how to convert the inputs into associated vectors than the
                 model's internal embedding lookup matrix.
-            return_audio_waveforms (`bool`, *optional*, defaults to `True`):
-                If `False`, won't generate the audio waveforms.
-            return_audio_codes (`bool`, *optional*):
+            return_audio_codes (`bool`, *optional*, defaults to `True`):
                 If `True`, will also returns the generated audio codes, i.e the intermediate audio "tokens" which transforms to `audio_sequences` once passed through the audio decoder.
             concat_unconditional_inputs (`bool`, *optional*, defaults to `True`):
                 If `False`, won't concatenate initial audio and text tokens.
@@ -286,15 +279,14 @@ class MoshiGenerationMixin(GenerationMixin):
         # needs to prepare generation config, even though it'll be done again in `generate`
         generation_config, kwargs = self._prepare_generation_config(kwargs.pop("generation_config", None), **kwargs)
 
-        input_ids, user_audio_codes, moshi_audio_codes, concat_unconditional_inputs = (
+        input_ids, user_audio_codes, assistant_audio_codes, concat_unconditional_inputs = (
             self._check_and_maybe_initialize_inputs(
                 input_ids=input_ids,
-                user_input_values=user_input_values,
                 user_audio_codes=user_audio_codes,
-                moshi_input_values=moshi_input_values,
-                moshi_audio_codes=moshi_audio_codes,
+                assistant_audio_codes=assistant_audio_codes,
                 inputs_embeds=inputs_embeds,
                 concat_unconditional_inputs=concat_unconditional_inputs,
+                num_user_frames=1 + (generation_config.max_new_tokens or 0),
             )
         )
 
@@ -312,14 +304,28 @@ class MoshiGenerationMixin(GenerationMixin):
             input_ids_length=input_ids_length,
         )
 
+        # Moshi is full-duplex and consumes a user frame at every step, so the user stream has to reach the end of
+        # the horizon. There is no stand-in: a caller with no live user encodes silence for the whole span with
+        # `MoshiProcessor.get_silence_audio_codes`.
+        if user_audio_codes is not None and user_audio_codes.shape[-1] < generation_config.max_length:
+            raise ValueError(
+                f"`user_audio_codes` covers {user_audio_codes.shape[-1]} frames but generation runs to "
+                f"{generation_config.max_length}. Moshi consumes a user frame at every step, so pass the whole "
+                "stream -- `processor.get_silence_audio_codes(num_frames)` produces silence for it."
+            )
+
         # retrieve depth decoder generation config if it exists
         if hasattr(generation_config, "depth_decoder_config"):
             depth_decoder_generation_config = generation_config.depth_decoder_config
         else:
             # we need to control the number of tokens generated by the depth decoder
+            # One token per codebook the depth decoder predicts (`dep_q`), plus the leading text token. This is
+            # the depth decoder's own count, which is larger than the parent's per-stream one when the user-side
+            # heads are kept.
+            num_depth_codebooks = self.depth_decoder.config.num_codebooks
             depth_decoder_generation_config = {
-                "min_length": self.num_codebooks + 1,
-                "max_length": self.num_codebooks + 1,
+                "min_length": num_depth_codebooks + 1,
+                "max_length": num_depth_codebooks + 1,
                 "cache_implementation": "static",
             }
         # update kwargs_depth_decoder: kwargs_depth_decoder have priority over depth_decoder_generation_config
@@ -336,16 +342,14 @@ class MoshiGenerationMixin(GenerationMixin):
             inputs_embeds,
             input_ids,
             user_audio_codes,
-            moshi_audio_codes,
+            assistant_audio_codes,
             user_delay_pattern_mask,
-            moshi_delay_pattern_mask,
+            assistant_delay_pattern_mask,
             attention_mask,
         ) = self._prepare_inputs_embeds_for_generation(
             input_ids=input_ids,
-            user_input_values=user_input_values,
             user_audio_codes=user_audio_codes,
-            moshi_input_values=moshi_input_values,
-            moshi_audio_codes=moshi_audio_codes,
+            assistant_audio_codes=assistant_audio_codes,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             generation_config=generation_config,
@@ -353,26 +357,18 @@ class MoshiGenerationMixin(GenerationMixin):
             concat_unconditional_inputs=concat_unconditional_inputs,
         )
 
-        # create blank user inputs - moshi needs a constant stream of user inputs
-        blank_input_values = torch.zeros(
-            (inputs_embeds.shape[0], 1, int(self.config.sampling_rate / self.config.audio_encoder_config.frame_rate)),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        blank_user_audio_codes = self.audio_encoder.encode(blank_input_values, num_quantizers=self.num_codebooks)[0]
-
         # set delay pattern mask for the rest of the generation
         kwargs["user_delay_pattern_mask"] = (
             user_delay_pattern_mask if user_delay_pattern_mask is not None else kwargs.get("user_delay_pattern_mask")
         )
-        kwargs["moshi_delay_pattern_mask"] = (
-            moshi_delay_pattern_mask
-            if moshi_delay_pattern_mask is not None
-            else kwargs.get("moshi_delay_pattern_mask")
+        kwargs["assistant_delay_pattern_mask"] = (
+            assistant_delay_pattern_mask
+            if assistant_delay_pattern_mask is not None
+            else kwargs.get("assistant_delay_pattern_mask")
         )
 
         self.generated_audio_codes = torch.repeat_interleave(
-            moshi_audio_codes, max(generation_config.num_beams, generation_config.num_return_sequences), dim=0
+            assistant_audio_codes, max(generation_config.num_beams, generation_config.num_return_sequences), dim=0
         )
 
         return_dict_in_generate = generation_config.num_beams > 1 or generation_config.return_dict_in_generate
@@ -381,7 +377,6 @@ class MoshiGenerationMixin(GenerationMixin):
             inputs_embeds=inputs_embeds,
             input_ids=input_ids,
             generation_config=generation_config,
-            blank_user_audio_codes=blank_user_audio_codes,
             kwargs_depth_decoder=kwargs_depth_decoder,
             return_dict_in_generate=return_dict_in_generate,
             output_scores=output_scores,
@@ -389,7 +384,7 @@ class MoshiGenerationMixin(GenerationMixin):
             **kwargs,
         )
 
-        if not return_audio_waveforms and not return_audio_codes:
+        if not return_audio_codes:
             if return_dict_in_generate and not generation_config.return_dict_in_generate:
                 return outputs.sequences
             return outputs
@@ -401,8 +396,8 @@ class MoshiGenerationMixin(GenerationMixin):
             output_text_ids = outputs.sequences
 
         if generation_config.num_return_sequences > 1:
-            moshi_delay_pattern_mask = torch.repeat_interleave(
-                moshi_delay_pattern_mask, generation_config.num_return_sequences, dim=0
+            assistant_delay_pattern_mask = torch.repeat_interleave(
+                assistant_delay_pattern_mask, generation_config.num_return_sequences, dim=0
             )
 
         if generation_config.num_beams > 1:
@@ -411,9 +406,9 @@ class MoshiGenerationMixin(GenerationMixin):
             # Beam indices are of shape `input_length + number_generated_tokens` but actually starts
             # indexing indices at index 0 instead of index `input_length-1`.
             # We thus discard the last `input_length` indices that are never used.
-            beam_indices = outputs.beam_indices[:, : -moshi_audio_codes.shape[-1]]
+            beam_indices = outputs.beam_indices[:, : -assistant_audio_codes.shape[-1]]
 
-            generated_audio_codes = self.generated_audio_codes[:, :, moshi_audio_codes.shape[-1] :]
+            generated_audio_codes = self.generated_audio_codes[:, :, assistant_audio_codes.shape[-1] :]
 
             # we've generated audio tokens `number_generated_tokens-1` times, so we use the corresponding beam indices to
             # retrieve the right audio tokens
@@ -421,10 +416,10 @@ class MoshiGenerationMixin(GenerationMixin):
             generated_audio_codes = torch.gather(generated_audio_codes, dim=0, index=expanded_beam_indices)
 
             # now, rebuild generated audio codes, this time with the right beam tracking
-            moshi_audio_codes = torch.repeat_interleave(
-                moshi_audio_codes, generation_config.num_return_sequences, dim=0
+            assistant_audio_codes = torch.repeat_interleave(
+                assistant_audio_codes, generation_config.num_return_sequences, dim=0
             )
-            self.generated_audio_codes = torch.cat((moshi_audio_codes, generated_audio_codes), dim=2)
+            self.generated_audio_codes = torch.cat((assistant_audio_codes, generated_audio_codes), dim=2)
 
             # use the last beam indice to retrieve the right self.last_hidden_state
             self.last_hidden_state = torch.index_select(self.last_hidden_state, dim=0, index=beam_indices[:, -1])
@@ -438,34 +433,26 @@ class MoshiGenerationMixin(GenerationMixin):
             **kwargs_depth_decoder,
         )
 
-        last_generated_audio_codes = last_generated_audio_codes[:, 1:].unsqueeze(2)
+        # Drop the leading text token, then keep only Moshi's own codebooks (see the same slice in the loop above).
+        last_generated_audio_codes = last_generated_audio_codes[:, 1:].unsqueeze(2)[:, : self.num_codebooks]
 
         self.generated_audio_codes = torch.cat([self.generated_audio_codes, last_generated_audio_codes], dim=2)
 
         # apply the pattern mask to the final audio ids
-        output_audio_codes = self.apply_delay_pattern_mask(self.generated_audio_codes, moshi_delay_pattern_mask)
+        output_audio_codes = self.apply_delay_pattern_mask(self.generated_audio_codes, assistant_delay_pattern_mask)
 
-        # revert the pattern delay mask by filtering the pad token id and bos token ids
-        mask = moshi_delay_pattern_mask != self.config.audio_vocab_size
-
-        output_audio_codes = output_audio_codes[mask].reshape(mask.shape[0], self.num_codebooks, -1)
-
-        output_values = None
-        if return_audio_waveforms:
-            output_values = self.audio_encoder.decode(
-                output_audio_codes,
-            ).audio_values
+        # Revert the delay pattern. Codebook 0 is unshifted and the rest are shifted right by one, so undoing it is
+        # a slice; the leading frame holds the BOS row and is dropped with it. Filtering on the pad/bos id instead
+        # would only work when the codes span exactly `max_length`, which is not the case when `generate` is driven
+        # one step at a time.
+        output_audio_codes = torch.cat([output_audio_codes[:, :1, 1:-1], output_audio_codes[:, 1:, 2:]], dim=1)
 
         output_audio_codes = output_audio_codes if return_audio_codes else None
 
         if generation_config.return_dict_in_generate:
-            return MoshiConditionalGenerationGenerateOutput(
-                audio_sequences=output_values, audio_codes=output_audio_codes, **outputs
-            )
+            return MoshiConditionalGenerationGenerateOutput(audio_codes=output_audio_codes, **outputs)
 
-        return MoshiConditionalGenerationGenerateOutput(
-            audio_sequences=output_values, sequences=output_text_ids, audio_codes=output_audio_codes
-        )
+        return MoshiConditionalGenerationGenerateOutput(sequences=output_text_ids, audio_codes=output_audio_codes)
 
     def prepare_inputs_for_generation(
         self,
@@ -477,10 +464,9 @@ class MoshiGenerationMixin(GenerationMixin):
         use_cache=True,
         logits_to_keep=None,
         user_delay_pattern_mask=None,
-        moshi_delay_pattern_mask=None,
+        assistant_delay_pattern_mask=None,
         kwargs_depth_decoder=None,
         is_first_iteration=False,
-        blank_user_audio_codes: torch.FloatTensor | None = None,
         **kwargs,
     ):
         # Overwritten -- Moshi has custom post-processing on the prepared inputs.
@@ -494,10 +480,9 @@ class MoshiGenerationMixin(GenerationMixin):
             use_cache=use_cache,
             logits_to_keep=logits_to_keep,
             user_delay_pattern_mask=user_delay_pattern_mask,
-            moshi_delay_pattern_mask=moshi_delay_pattern_mask,
+            assistant_delay_pattern_mask=assistant_delay_pattern_mask,
             kwargs_depth_decoder=kwargs_depth_decoder,
             is_first_iteration=is_first_iteration,
-            blank_user_audio_codes=blank_user_audio_codes,
             **kwargs,
         )
 
@@ -520,18 +505,29 @@ class MoshiGenerationMixin(GenerationMixin):
             # the first tokens are text tokens
             generated_audio_codes = generated_audio_codes[:, 1:].unsqueeze(2)
 
+            # A depth decoder trained on both streams predicts `dep_q = 2 * num_codebooks` codebooks, Moshi's own
+            # first and the user's after (`forward` feeds them in that order). Only Moshi's half is fed back as the
+            # generated audio; the user stream is supplied by the caller.
+            generated_audio_codes = generated_audio_codes[:, : self.num_codebooks]
+
+            # Advance the user stream by one frame. `user_delay_pattern_mask` holds the stream the caller passed in
+            # and it reaches the end of the horizon, so the placeholder concatenated here is always overwritten by
+            # `apply_delay_pattern_mask`; it only exists to give the mask a tensor of the right length.
+            placeholder = self.generated_audio_codes.new_zeros(
+                (self.generated_audio_codes.shape[0], self.generated_audio_codes.shape[1], 1)
+            )
             user_audio_codes = self.apply_delay_pattern_mask(
-                torch.cat(
-                    [self.generated_audio_codes, blank_user_audio_codes.to(self.generated_audio_codes.device)], dim=2
-                ),
+                torch.cat([self.generated_audio_codes, placeholder], dim=2),
                 user_delay_pattern_mask,
             )[:, :, -1:]
             self.generated_audio_codes = self.apply_delay_pattern_mask(
-                torch.cat([self.generated_audio_codes, generated_audio_codes], dim=2), moshi_delay_pattern_mask
+                torch.cat([self.generated_audio_codes, generated_audio_codes], dim=2), assistant_delay_pattern_mask
             )
 
             inputs_embeds, _, _, _, _, _, _ = self._prepare_inputs_embeds_for_generation(
-                input_ids, moshi_audio_codes=self.generated_audio_codes[:, :, -1:], user_audio_codes=user_audio_codes
+                input_ids,
+                assistant_audio_codes=self.generated_audio_codes[:, :, -1:],
+                user_audio_codes=user_audio_codes,
             )
 
             model_inputs["input_ids"] = None
@@ -614,7 +610,7 @@ class MoshiGenerationMixin(GenerationMixin):
         input_ids = input_ids_shifted[..., :seq_len_to_keep]
         return input_ids, pattern_mask
 
-    def get_unconditional_inputs(self, num_samples=1):
+    def get_unconditional_inputs(self, num_samples=1, num_user_frames=1):
         """
         Helper function to get null inputs for unconditional generation, enabling the model to be used without the
         feature extractor or tokenizer.
@@ -622,6 +618,8 @@ class MoshiGenerationMixin(GenerationMixin):
         Args:
             num_samples (int, *optional*):
                 Number of audio samples to unconditionally generate.
+            num_user_frames (int, *optional*):
+                Length of the returned user stream. It has to reach the end of the generation horizon.
             max_new_tokens (int, *optional*):
                 Number of tokens to generate for each sample. More tokens means longer audio samples, at the expense of
                 longer inference (since more audio tokens need to be generated per sample).
@@ -638,11 +636,13 @@ class MoshiGenerationMixin(GenerationMixin):
         ```"""
 
         input_ids = torch.ones((num_samples, 1), device=self.device, dtype=torch.int64) * self.config.vocab_size
+        # Moshi consumes a user frame at every generated step, so callers that will generate need the stream to
+        # reach the end of the horizon: `num_user_frames` is `1 + max_new_tokens` in that case.
         user_audio_codes = (
-            torch.ones((num_samples, self.num_codebooks, 1), device=self.device, dtype=torch.int64)
+            torch.ones((num_samples, self.num_codebooks, num_user_frames), device=self.device, dtype=torch.int64)
             * self.config.audio_vocab_size
         )
-        moshi_audio_codes = (
+        assistant_audio_codes = (
             torch.ones((num_samples, self.num_codebooks, 1), device=self.device, dtype=torch.int64)
             * self.config.audio_vocab_size
         )
@@ -651,25 +651,24 @@ class MoshiGenerationMixin(GenerationMixin):
         return MoshiUnconditionalInput(
             input_ids=input_ids,
             user_audio_codes=user_audio_codes,
-            moshi_audio_codes=moshi_audio_codes,
+            assistant_audio_codes=assistant_audio_codes,
             attention_mask=attention_mask,
         )
 
     def _check_and_maybe_initialize_inputs(
         self,
         input_ids=None,
-        user_input_values=None,
         user_audio_codes=None,
-        moshi_input_values=None,
-        moshi_audio_codes=None,
+        assistant_audio_codes=None,
         inputs_embeds=None,
         concat_unconditional_inputs=None,
+        num_user_frames=1,
     ):
         inputs = input_ids if inputs_embeds is None else inputs_embeds
-        user_input = user_audio_codes if user_input_values is None else user_input_values
-        moshi_input = moshi_audio_codes if moshi_input_values is None else moshi_input_values
+        user_input = user_audio_codes
+        assistant_input = assistant_audio_codes
 
-        one_input_has_been_passed = (user_input is not None) or (moshi_input is not None) or (inputs is not None)
+        one_input_has_been_passed = (user_input is not None) or (assistant_input is not None) or (inputs is not None)
 
         # concat_unconditional_inputs will be False if inputs_embeds is used
         concat_unconditional_inputs = concat_unconditional_inputs and not (
@@ -679,11 +678,11 @@ class MoshiGenerationMixin(GenerationMixin):
         # if one or two of the three required inputs have been passed, throws an error
         if one_input_has_been_passed and (user_input is None):
             raise ValueError(
-                "No user audio inputs have been passed alongside the other inputs. Make sure either `user_input_values` or `user_audio_codes` is passed or use `MoshiForConditionalGeneration.get_unconditional_inputs`. Check the `MoshiForConditionalGeneration` docstrings for more information."
+                "No user audio inputs have been passed alongside the other inputs. Make sure `user_audio_codes` is passed or use `MoshiForConditionalGeneration.get_unconditional_inputs`. Check the `MoshiForConditionalGeneration` docstrings for more information."
             )
-        elif one_input_has_been_passed and (moshi_input is None):
+        elif one_input_has_been_passed and (assistant_input is None):
             raise ValueError(
-                "No Moshi audio inputs have been passed alongside the other inputs. Make sure either `moshi_input_values` or `moshi_audio_codes` is passed or use `MoshiForConditionalGeneration.get_unconditional_inputs`. Check the `MoshiForConditionalGeneration` docstrings for more information."
+                "No Moshi audio inputs have been passed alongside the other inputs. Make sure `assistant_audio_codes` is passed or use `MoshiForConditionalGeneration.get_unconditional_inputs`. Check the `MoshiForConditionalGeneration` docstrings for more information."
             )
         elif one_input_has_been_passed and (inputs is None):
             raise ValueError(
@@ -691,27 +690,29 @@ class MoshiGenerationMixin(GenerationMixin):
             )
         elif not one_input_has_been_passed:
             # if no inputs have been passed, use default values
-            unconditional_inputs = self.get_unconditional_inputs()
+            # Nothing was passed, so there is no user either: hand generation a user stream that reaches the end
+            # of the horizon.
+            unconditional_inputs = self.get_unconditional_inputs(num_user_frames=num_user_frames)
             input_ids = unconditional_inputs.input_ids
             user_audio_codes = unconditional_inputs.user_audio_codes
-            moshi_audio_codes = unconditional_inputs.moshi_audio_codes
+            assistant_audio_codes = unconditional_inputs.assistant_audio_codes
 
             # in that case, no need to concat unconditional inputs
             concat_unconditional_inputs = False
         else:
             # check if same sequence length
             user_seq_length = user_input.shape[-1]
-            moshi_seq_length = moshi_input.shape[-1]
+            assistant_seq_length = assistant_input.shape[-1]
             tokens_seq_length = inputs.shape[1]
 
-            ratio = self.config.audio_encoder_config.frame_rate / self.config.sampling_rate
-            moshi_seq_length = math.ceil(moshi_seq_length * ratio) if moshi_audio_codes is None else moshi_seq_length
-            user_seq_length = math.ceil(user_seq_length * ratio) if user_audio_codes is None else user_seq_length
-
-            if tokens_seq_length != moshi_seq_length or tokens_seq_length != user_seq_length:
+            # The text and assistant streams describe what has already happened, so they must line up exactly. The
+            # user stream may run ahead: Moshi consumes a user frame at every step, so a caller who already knows
+            # what the user says can hand the whole thing over instead of feeding it one frame at a time.
+            if tokens_seq_length != assistant_seq_length or user_seq_length < tokens_seq_length:
                 raise ValueError(
-                    "At least one of the 3 inputs of `MoshiForConditionalGeneration` doesn't have the same sequence length as the others."
-                    "Make sure that they all have the same sequence length. Check the `MoshiForConditionalGeneration` docstrings for more information."
+                    f"`input_ids` ({tokens_seq_length}) and `assistant_audio_codes` ({assistant_seq_length}) must have "
+                    f"the same sequence length, and `user_audio_codes` ({user_seq_length}) must be at least as long. "
+                    "Check the `MoshiForConditionalGeneration` docstrings for more information."
                 )
 
-        return input_ids, user_audio_codes, moshi_audio_codes, concat_unconditional_inputs
+        return input_ids, user_audio_codes, assistant_audio_codes, concat_unconditional_inputs

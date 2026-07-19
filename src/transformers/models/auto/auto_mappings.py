@@ -1079,6 +1079,7 @@ PROCESSOR_MAPPING_NAMES = OrderedDict(
         ("minimax_m3_vl", "MiniMaxM3VLProcessor"),
         ("mllama", "MllamaProcessor"),
         ("moonshine_streaming", "MoonshineStreamingProcessor"),
+        ("moshi", "MoshiProcessor"),
         ("musicflamingo", "MusicFlamingoProcessor"),
         ("musicgen", "MusicgenProcessor"),
         ("musicgen_melody", "MusicgenMelodyProcessor"),
