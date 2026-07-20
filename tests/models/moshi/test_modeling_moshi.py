@@ -765,16 +765,15 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
                 concat_unconditional_inputs=False,
             )
 
-            # check same results from unconditional or no inputs
-            outputs_from_unconditional = model.generate(
-                **model.get_unconditional_inputs(num_samples=1, num_user_frames=6),
-                max_new_tokens=5,
-                concat_unconditional_inputs=False,
-            )
-            outputs_from_none = model.generate(max_new_tokens=5)
-
-            self.assertTrue((outputs_from_unconditional.sequences == outputs_from_none.sequences).all())
-            self.assertTrue(torch.allclose(outputs_from_unconditional.audio_codes, outputs_from_none.audio_codes))
+            # Generating from no inputs at all is only possible for a model that predicts the user stream itself.
+            # Otherwise Moshi needs a user frame per step and the codec that turns silence into those frames lives
+            # in the processor, so `generate` asks for them instead of standing in the reserved "has not spoken
+            # yet" id -- repeating that id across the horizon is off-distribution and degrades what comes out.
+            if model.predicts_user_stream:
+                model.generate(max_new_tokens=5)
+            else:
+                with self.assertRaisesRegex(ValueError, "get_silence_audio_codes"):
+                    model.generate(max_new_tokens=5)
 
     @unittest.skip(reason="Compile not yet supported because in Moshi models")
     def test_sdpa_can_dispatch_on_flash(self):

@@ -327,7 +327,13 @@ class MoshiGenerationMixin(GenerationMixin):
                 assistant_audio_codes=assistant_audio_codes,
                 inputs_embeds=inputs_embeds,
                 concat_unconditional_inputs=concat_unconditional_inputs,
-                num_user_frames=1 + (generation_config.max_new_tokens or 0),
+                # One frame, i.e. a prompt saying "the user has not spoken yet". Stretching that id across the
+                # whole horizon would instead claim the user never speaks at all, which is not what silence
+                # sounds like to Moshi: the codec encodes silence to ordinary codes, and feeding the reserved id
+                # in their place is off-distribution enough to turn the generated text into word salad. A caller
+                # who wants to generate without a live user passes real silence from
+                # `MoshiProcessor.get_silence_audio_codes`; the check below points them there.
+                num_user_frames=1,
             )
         )
 
@@ -363,8 +369,12 @@ class MoshiGenerationMixin(GenerationMixin):
         ):
             raise ValueError(
                 f"`user_audio_codes` covers {user_audio_codes.shape[-1]} frames but generation runs to "
-                f"{generation_config.max_length}. Moshi consumes a user frame at every step, so pass the whole "
-                "stream -- `processor.get_silence_audio_codes(num_frames)` produces silence for it."
+                f"{generation_config.max_length}. Moshi consumes a user frame at every step, so the stream has to "
+                "reach the end of the horizon. To generate without a live user, hand it encoded silence rather "
+                "than a shorter stream:\n"
+                "    inputs = model.get_unconditional_inputs()\n"
+                f"    inputs.user_audio_codes = processor.get_silence_audio_codes({generation_config.max_length})\n"
+                "    model.generate(**inputs, max_new_tokens=...)"
             )
 
         # retrieve depth decoder generation config if it exists
@@ -770,7 +780,32 @@ class MoshiGenerationMixin(GenerationMixin):
             inputs_embeds is not None and input_ids is None
         )
 
-        # if one or two of the three required inputs have been passed, throws an error
+        # A stream the caller left out is filled with the audio BOS id, the same way `get_unconditional_inputs`
+        # does: it means "this side has not spoken yet". That is the normal shape of a first turn -- the processor
+        # only produces `assistant_audio_codes` when it is handed `assistant_audio` -- so the missing streams are
+        # filled in rather than rejected, taking their length from whichever stream the caller did pass.
+        if one_input_has_been_passed:
+            reference = next(x for x in (inputs, user_input, assistant_input) if x is not None)
+            batch_size, prompt_length, device = reference.shape[0], reference.shape[-1], reference.device
+
+            def _silent_stream():
+                return torch.full(
+                    (batch_size, self.num_codebooks, prompt_length),
+                    self.config.audio_vocab_size,
+                    device=device,
+                    dtype=torch.int64,
+                )
+
+            if user_audio_codes is None:
+                user_audio_codes = user_input = _silent_stream()
+            if assistant_audio_codes is None:
+                assistant_audio_codes = assistant_input = _silent_stream()
+            if inputs is None:
+                # The text stream opens on the same reserved id the audio streams do.
+                input_ids = inputs = torch.full(
+                    (batch_size, prompt_length), self.config.vocab_size, device=device, dtype=torch.int64
+                )
+
         if one_input_has_been_passed and (user_input is None):
             raise ValueError(
                 "No user audio inputs have been passed alongside the other inputs. Make sure `user_audio_codes` is passed or use `MoshiForConditionalGeneration.get_unconditional_inputs`. Check the `MoshiForConditionalGeneration` docstrings for more information."

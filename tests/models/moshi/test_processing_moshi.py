@@ -70,8 +70,21 @@ class MoshiProcessorTest(unittest.TestCase):
         processor = self.get_processor()
 
         self.assertEqual(sorted(processor(text="hello").keys()), ["attention_mask", "input_ids"])
-        self.assertEqual(sorted(processor(audio=self.get_audio()).keys()), ["user_audio_codes"])
-        self.assertEqual(sorted(processor(assistant_audio=self.get_audio()).keys()), ["assistant_audio_codes"])
+        # Either audio argument on its own still yields both streams: Moshi listens to itself and to the user at
+        # every frame, so the side the caller left out is filled with encoded silence rather than left absent.
+        both = ["assistant_audio_codes", "user_audio_codes"]
+        self.assertEqual(sorted(processor(audio=self.get_audio()).keys()), both)
+        self.assertEqual(sorted(processor(assistant_audio=self.get_audio()).keys()), both)
+
+    def test_missing_stream_is_encoded_silence_not_the_reserved_id(self):
+        processor = self.get_processor()
+        inputs = processor(audio=self.get_audio())
+
+        # The reserved id means "has not spoken yet" and is one past the codec's range; standing in for silence
+        # with it is off-distribution and degrades generation, so the fill has to be real codes.
+        codebook_size = processor.audio_tokenizer.config.codebook_size
+        self.assertTrue((inputs["assistant_audio_codes"] < codebook_size).all())
+        self.assertEqual(inputs["assistant_audio_codes"].shape, inputs["user_audio_codes"].shape)
 
     def test_no_input_raises(self):
         with self.assertRaises(ValueError):

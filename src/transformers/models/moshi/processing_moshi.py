@@ -95,6 +95,18 @@ class MoshiProcessor(ProcessorMixin):
                 input_values, num_quantizers=self.num_codebooks
             ).audio_codes
 
+        # Moshi always listens to both streams at once, so a prompt that carries only one of them is incomplete.
+        # The missing side was silent, and silence is ordinary audio to Mimi -- it encodes to real codes, not to
+        # the reserved "has not spoken yet" id. Filling it here rather than leaving `generate` to stand in that id
+        # matters: repeating the reserved id for the length of a prompt is far enough off-distribution to turn the
+        # generated text into word salad.
+        stream_frames = [codes.shape[-1] for key, codes in data.items() if key.endswith("_audio_codes")]
+        if stream_frames:
+            batch_size = next(codes.shape[0] for key, codes in data.items() if key.endswith("_audio_codes"))
+            for key in ("user_audio_codes", "assistant_audio_codes"):
+                if key not in data:
+                    data[key] = self.get_silence_audio_codes(max(stream_frames), batch_size=batch_size)
+
         # Moshi consumes one text token per audio frame, and rejects inputs whose lengths disagree. The original
         # model achieves this by padding the text in between token enunciations, so the text stream is padded out
         # to the number of audio frames here rather than leaving the caller to do it.
