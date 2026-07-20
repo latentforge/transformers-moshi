@@ -449,21 +449,27 @@ class MoshiGenerationMixin(GenerationMixin):
             dim=0,
         )
 
-        return_dict_in_generate = generation_config.num_beams > 1 or generation_config.return_dict_in_generate
+        # Beam search needs the scores and the beam indices to reorder the audio history afterwards, so both are
+        # forced on. They go on the config rather than alongside it: passing generation arguments next to a
+        # `generation_config` is deprecated, and doing it here warned on every call.
+        # What the caller actually asked for, kept because the checks below distinguish "the caller wanted a dict"
+        # from "beam search needed one".
+        caller_wants_dict = generation_config.return_dict_in_generate
+        return_dict_in_generate = generation_config.num_beams > 1 or caller_wants_dict
         output_scores = generation_config.num_beams > 1 or generation_config.output_scores
+        generation_config.return_dict_in_generate = return_dict_in_generate
+        generation_config.output_scores = output_scores
         outputs = super().generate(
             inputs_embeds=inputs_embeds,
             input_ids=input_ids,
             generation_config=generation_config,
             kwargs_depth_decoder=kwargs_depth_decoder,
-            return_dict_in_generate=return_dict_in_generate,
-            output_scores=output_scores,
             attention_mask=attention_mask,
             **kwargs,
         )
 
         if not return_audio_codes:
-            if return_dict_in_generate and not generation_config.return_dict_in_generate:
+            if return_dict_in_generate and not caller_wants_dict:
                 return outputs.sequences
             return outputs
 
@@ -540,7 +546,7 @@ class MoshiGenerationMixin(GenerationMixin):
             predicted = self.generated_user_audio_codes[:, :, self._user_supplied_steps :]
             output_user_audio_codes = predicted if predicted.shape[-1] > 0 else None
 
-        if generation_config.return_dict_in_generate:
+        if caller_wants_dict:
             return MoshiConditionalGenerationGenerateOutput(
                 audio_codes=output_audio_codes, user_audio_codes=output_user_audio_codes, **outputs
             )

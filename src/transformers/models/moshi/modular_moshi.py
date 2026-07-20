@@ -651,8 +651,11 @@ class MoshiDepthDecoderModel(MoshiPreTrainedModel):
         # If inputs_embeds is provided, it has the priority over input_ids, which won't be used
         if inputs_embeds is None:
             inputs_embeds = []
-            for position_idx in codebook_idx:
-                position_idx = position_idx.item()
+            # Which embedding a position uses is a Python-level choice -- `embed_tokens` is a `ModuleList` with one
+            # entry per codebook -- so the loop runs over plain ints. Reading them back off `codebook_idx` with
+            # `.item()` would force a device sync per position and break the compiled graph, for indices that are
+            # already known here: it is built as `arange(seq_len) + past_seen_tokens`.
+            for position_idx in range(past_seen_tokens, past_seen_tokens + input_ids.shape[1]):
                 if position_idx == 0:
                     inputs_embeds.append(self.text_embed_tokens(input_ids[:, [position_idx]]))
                 else:
