@@ -860,7 +860,18 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, MoshiGenerationMixin):
 
         self.depth_decoder = MoshiDepthDecoderForCausalLM._from_config(config.depth_decoder_config)
 
+        # `num_codebooks` is the width of a single audio stream. The depth decoder predicts either just Moshi's own
+        # stream, or Moshi's followed by the user's -- the released checkpoints do the former because the user-side
+        # heads were dropped, a model trained on both streams does the latter. Anything else cannot be split into
+        # streams, so reject it here rather than silently keeping the leading half.
         self.num_codebooks = config.num_codebooks
+        predicted_codebooks = config.depth_decoder_config.num_codebooks
+        if predicted_codebooks not in (self.num_codebooks, 2 * self.num_codebooks):
+            raise ValueError(
+                f"The depth decoder predicts {predicted_codebooks} codebooks, which is neither one stream "
+                f"({self.num_codebooks}) nor both ({2 * self.num_codebooks})."
+            )
+        self.predicts_user_stream = predicted_codebooks == 2 * self.num_codebooks
         self.post_init()
 
     def get_depth_decoder(self):

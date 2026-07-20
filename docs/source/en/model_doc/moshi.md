@@ -92,11 +92,11 @@ Moshi is a streaming auto-regressive model with two streams of audio. To put it 
 
 Audio codes are produced by [`MoshiProcessor`], which owns the Mimi codec. The model itself only ever sees codes.
 
-These three inputs must be synchronized. Meaning that their lengths must correspond to the same number of tokens.
+`input_ids` and `assistant_audio_codes` describe what has already happened, so they must be synchronized: their lengths must correspond to the same number of tokens. `user_audio_codes` may run ahead of them, and usually has to — see the note on the generation horizon below.
 
 You can dynamically use the 3 inputs depending on what you want to test:
 
-1. Simply check the model response to an user prompt - in that case, `input_ids` can be filled with pad tokens and `user_audio_codes` can be the codes for silence, from [`MoshiProcessor.get_blank_user_audio_codes`].
+1. Simply check the model response to an user prompt - in that case, `input_ids` can be filled with pad tokens and `user_audio_codes` can be the codes for silence, from [`MoshiProcessor.get_silence_audio_codes`].
 2. Test more complex behaviour - in that case, you must be careful about how the input tokens are synchronized with the audios.
 
 <Tip>
@@ -111,11 +111,17 @@ To follow the example of the following image, `"Hello, I'm Moshi"` could be tran
 <img src="https://huggingface.co/datasets/ylacombe/benchmark-comparison/resolve/main/moshi_text_sync.png">
 </div>
 
-[`MoshiForConditionalGeneration.generate`] then auto-regressively feeds to itself its own audio stream, but since it doesn't have access to the user input stream while using `transformers`, it will thus **assume that the user is producing blank audio**.
+[`MoshiForConditionalGeneration.generate`] then auto-regressively feeds to itself its own audio stream. There is no live user in `transformers`, so **the user stream has to be supplied up front for the whole generation horizon**: Moshi consumes one user frame at every step. When you have nothing for the user to say, hand it silence from [`MoshiProcessor.get_silence_audio_codes`], which encodes `num_frames` of silence in one go and returns a `(batch_size, num_codebooks, num_frames)` tensor. Encoding the whole span at once matters: Mimi is a streaming codec, so silence does not quantize to one constant frame that you could repeat.
+
+<Tip warning={true}>
+
+If `user_audio_codes` falls short of `max_length`, `generate` raises a `ValueError`. The exception is a checkpoint whose depth decoder predicts *both* streams (`depth_decoder_config.num_codebooks == 2 * num_codebooks`, exposed as `model.predicts_user_stream`): there the model fills in the frames you did not provide, and returns them as `user_audio_codes` on the output.
+
+</Tip>
+
+Generation returns codes, not waveforms: `sequences` for the text stream and `audio_codes` for Moshi's audio stream. Use [`MoshiProcessor.decode_audio`] to turn the codes back into a waveform.
 
 ```python
-import math
-
 import torch
 from datasets import Audio, load_dataset
 
@@ -134,24 +140,32 @@ sampling_rate = processor.feature_extractor.sampling_rate
 librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=sampling_rate))
 audio_sample = librispeech_dummy[-1]["audio"]["array"]
 
-# we suppose moshi didn't say anything while the user spoke, so its stream is silence
+# `audio` is the user's stream; it comes back as `user_audio_codes`
 inputs = processor(audio=audio_sample, sampling_rate=sampling_rate).to(device=device)
 user_audio_codes = inputs.user_audio_codes
-assistant_audio_codes = processor.get_blank_user_audio_codes(user_audio_codes.shape[0]).to(device)
-assistant_audio_codes = assistant_audio_codes.expand(-1, -1, user_audio_codes.shape[-1])
+batch_size, _, prompt_frames = user_audio_codes.shape
+
+# we suppose moshi didn't say anything while the user spoke, so its own stream is silence
+assistant_audio_codes = processor.get_silence_audio_codes(prompt_frames, batch_size=batch_size).to(device)
 
 # prepare moshi input ids - we suppose moshi didn't say anything while the user spoke
-input_ids = torch.ones((1, user_audio_codes.shape[-1]), device=device, dtype=torch.int64)
+input_ids = torch.ones((batch_size, prompt_frames), device=device, dtype=torch.int64)
 input_ids = input_ids * processor.tokenizer.encode("<pad>")[0]
 
-# generate 25 new tokens (around 2s of audio)
+# generate 25 new tokens (around 2s of audio). Moshi consumes a user frame at every step, and moshiko's depth
+# decoder does not predict the user stream, so extend it with silence to cover the whole horizon.
+max_new_tokens = 25
+silence = processor.get_silence_audio_codes(max_new_tokens + 1, batch_size=batch_size).to(device)
+user_audio_codes = torch.cat([user_audio_codes, silence], dim=-1)
+
 output = model.generate(
     input_ids=input_ids,
     user_audio_codes=user_audio_codes,
     assistant_audio_codes=assistant_audio_codes,
-    max_new_tokens=25,
+    max_new_tokens=max_new_tokens,
 )
 
+# `generate` returns codes; the processor turns Moshi's audio codes back into a waveform
 text_tokens = output.sequences
 audio_waveforms = processor.decode_audio(output.audio_codes)
 ```
@@ -200,6 +214,8 @@ The original code can be found [here](https://github.com/kyutai-labs/moshi).
 
 [[autodoc]] MoshiProcessor
     - __call__
+    - get_silence_audio_codes
+    - decode_audio
 
 ## MoshiForConditionalGeneration
 
