@@ -786,21 +786,25 @@ class MoshiForCausalLM(MoshiPreTrainedModel, GenerationMixin):
         **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
         Example:
 
         ```python
         >>> from transformers import AutoTokenizer, MoshiForCausalLM
 
-        >>> model = MoshiForCausalLM.from_pretrained("meta-moshi/Moshi-2-7b-hf")
-        >>> tokenizer = AutoTokenizer.from_pretrained("meta-moshi/Moshi-2-7b-hf")
+        >>> model = MoshiForCausalLM.from_pretrained("kmhf/hf-moshiko")
+        >>> tokenizer = AutoTokenizer.from_pretrained("kmhf/hf-moshiko")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
 
         >>> # Generate
         >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True)[0]
         ```"""
         outputs: BaseModelOutputWithPast = self.model(
             input_ids=input_ids,
@@ -919,16 +923,16 @@ class MoshiForConditionalGeneration(MoshiPreTrainedModel, MoshiGenerationMixin):
             `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.audio_vocab_size]`
 
-        Examples:
+        Example:
+
         ```python
         >>> from transformers import MoshiForConditionalGeneration
-        >>> import torch
 
         >>> model = MoshiForConditionalGeneration.from_pretrained("kmhf/hf-moshiko")
-        >>> inputs = moshi.get_unconditional_inputs()
+        >>> inputs = model.get_unconditional_inputs()
 
-        >>> logits = model(**inputs, ).logits
-        >>> logits.shape  # (bsz, seq_len, text_vocab_size)
+        >>> logits = model(**inputs).logits
+        >>> logits.shape  # (batch_size, sequence_length, text_vocab_size)
         torch.Size([1, 1, 32000])
         ```"""
         # Resolve the output flags here so the decoder's output-capturing sees a concrete boolean instead of
