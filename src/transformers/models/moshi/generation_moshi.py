@@ -424,6 +424,13 @@ class MoshiGenerationMixin(GenerationMixin):
             assistant_delay_pattern_mask=kwargs.get("assistant_delay_pattern_mask"),
         )
 
+        # The delay pattern masks above had to be built out to the horizon, which is why `max_length` was resolved
+        # early. The base loop resolves it again from `max_new_tokens` and reads a `max_length` that is already set
+        # as one the caller asked for, so it warns about a clash with itself on every call. Hand it back the
+        # unresolved config: it recomputes the same horizon, since by now `input_ids` carries the frame that
+        # `concat_unconditional_inputs` prepended.
+        generation_config.max_length = None
+
         # set delay pattern mask for the rest of the generation
         self.generated_user_audio_codes = None
         kwargs["user_delay_pattern_mask"] = (
