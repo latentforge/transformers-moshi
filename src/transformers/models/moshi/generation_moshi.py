@@ -173,6 +173,9 @@ class MoshiGenerationMixin(GenerationMixin):
         # shifts every codebook but the first, so a prompt that went through it once and is handed back as the
         # next call's prompt would be shifted again, one frame per round trip.
         undelayed_assistant_audio_codes = assistant_audio_codes
+        # Same for the user stream: the loop keeps its history undelayed too, so the prompt has to enter it in
+        # that form rather than being read back off the delayed tensor.
+        undelayed_user_audio_codes = user_audio_codes
 
         if inputs_embeds is None or apply_delay_pattern_mask:
             # A caller driving `generate` a step at a time hands back the mask it got, so the delay is *applied*
@@ -252,6 +255,7 @@ class MoshiGenerationMixin(GenerationMixin):
             user_audio_codes,
             assistant_audio_codes,
             undelayed_assistant_audio_codes,
+            undelayed_user_audio_codes,
             user_delay_pattern_mask,
             assistant_delay_pattern_mask,
             attention_mask,
@@ -408,6 +412,7 @@ class MoshiGenerationMixin(GenerationMixin):
             user_audio_codes,
             assistant_audio_codes,
             undelayed_assistant_audio_codes,
+            undelayed_user_audio_codes,
             user_delay_pattern_mask,
             assistant_delay_pattern_mask,
             attention_mask,
@@ -448,6 +453,23 @@ class MoshiGenerationMixin(GenerationMixin):
             max(generation_config.num_beams, generation_config.num_return_sequences),
             dim=0,
         )
+        # The user stream needs its own undelayed history for the same reason the assistant one does: the delay
+        # pattern reads codebook `k` of a frame from `k` frames back, so applying it to the wrong stream's history
+        # feeds the model the other speaker's codes. Seeded with what the caller supplied, or with the assistant
+        # prompt's shape when nothing was.
+        # Only the prompt goes in, even when the caller supplied a stream that runs past it: the loop appends one
+        # frame per step, so seeding it with the whole horizon would grow past the delay mask. The frames beyond
+        # the prompt are forced through that mask instead, which is what makes the caller win over the prediction.
+        user_history = (
+            undelayed_user_audio_codes[:, :, : undelayed_assistant_audio_codes.shape[-1]]
+            if undelayed_user_audio_codes is not None
+            else torch.zeros_like(undelayed_assistant_audio_codes)
+        )
+        self.generated_user_codes = torch.repeat_interleave(
+            user_history,
+            max(generation_config.num_beams, generation_config.num_return_sequences),
+            dim=0,
+        )
 
         # Beam search needs the scores and the beam indices to reorder the audio history afterwards, so both are
         # forced on. They go on the config rather than alongside it: passing generation arguments next to a
@@ -459,6 +481,7 @@ class MoshiGenerationMixin(GenerationMixin):
         output_scores = generation_config.num_beams > 1 or generation_config.output_scores
         generation_config.return_dict_in_generate = return_dict_in_generate
         generation_config.output_scores = output_scores
+
         outputs = super().generate(
             inputs_embeds=inputs_embeds,
             input_ids=input_ids,
@@ -618,15 +641,19 @@ class MoshiGenerationMixin(GenerationMixin):
                 fill = self.generated_audio_codes.new_zeros(
                     (self.generated_audio_codes.shape[0], self.generated_audio_codes.shape[1], 1)
                 )
+            self.generated_user_codes = torch.cat([self.generated_user_codes, fill], dim=2)
             user_audio_codes = self.apply_delay_pattern_mask(
-                torch.cat([self.generated_audio_codes, fill], dim=2),
+                self.generated_user_codes,
                 user_delay_pattern_mask,
             )[:, :, -1:]
             if predicted_user_codes is not None:
+                # The *undelayed* prediction, for the same reason the assistant history is kept undelayed: the
+                # delayed frame above is a wire format for feeding the model back, and returning it would hand the
+                # caller codes whose every codebook but the first is a frame out of place.
                 self.generated_user_audio_codes = (
-                    user_audio_codes
+                    predicted_user_codes
                     if self.generated_user_audio_codes is None
-                    else torch.cat([self.generated_user_audio_codes, user_audio_codes], dim=2)
+                    else torch.cat([self.generated_user_audio_codes, predicted_user_codes], dim=2)
                 )
             # Kept undelayed. The delay pattern is a wire format, not the history itself: writing it back into the
             # state would mean a later `build_delay_pattern_mask` -- which shifts whatever it is handed -- shifts
@@ -636,7 +663,7 @@ class MoshiGenerationMixin(GenerationMixin):
                 self.generated_audio_codes, assistant_delay_pattern_mask
             )
 
-            inputs_embeds, _, _, _, _, _, _, _ = self._prepare_inputs_embeds_for_generation(
+            inputs_embeds, *_ = self._prepare_inputs_embeds_for_generation(
                 input_ids,
                 assistant_audio_codes=delayed_audio_codes[:, :, -1:],
                 user_audio_codes=user_audio_codes,
