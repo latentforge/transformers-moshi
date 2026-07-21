@@ -473,6 +473,22 @@ class MoshiPreTrainedModel(PreTrainedModel):
             init.normal_(module.weight)
 
 
+def get_past_seen_tokens(past_key_values: Cache | None) -> int:
+    """
+    How many codebooks the depth decoder has already cached, as a Python `int`.
+
+    A static cache -- which is what the depth decoder generates with -- keeps its length as a 0-d tensor, so that
+    the count stays on device for cudagraphs. Here it is only ever used as an offset: to pick an embedding out of a
+    `ModuleList` and to index `input_ids`. Left as a tensor it makes those indices tensors too, and `torch.compile`
+    cannot trace an index it has to read the value of. Converting once per forward costs a single sync, against one
+    per position had the loop read it back with `.item()`.
+    """
+    if past_key_values is None:
+        return 0
+    past_seen_tokens = past_key_values.get_seq_length()
+    return int(past_seen_tokens) if torch.is_tensor(past_seen_tokens) else past_seen_tokens
+
+
 def get_codebook_idx(
     input_ids: torch.LongTensor | None,
     inputs_embeds: torch.FloatTensor | None,
@@ -547,7 +563,7 @@ class MoshiDepthDecoderModel(MoshiPreTrainedModel):
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
-        past_seen_tokens = 0 if past_key_values is None else past_key_values.get_seq_length()
+        past_seen_tokens = get_past_seen_tokens(past_key_values)
         codebook_idx = get_codebook_idx(input_ids, inputs_embeds, past_seen_tokens)
 
         if position_ids is None:
@@ -641,7 +657,7 @@ class MoshiDepthDecoderForCausalLM(MoshiPreTrainedModel, GenerationMixin):
         """
         # `lm_heads` is indexed per codebook, so recompute the same indices the backbone uses. This must happen
         # before the backbone call, which advances `past_key_values`.
-        past_seen_tokens = 0 if past_key_values is None else past_key_values.get_seq_length()
+        past_seen_tokens = get_past_seen_tokens(past_key_values)
         codebook_idx = get_codebook_idx(input_ids, inputs_embeds, past_seen_tokens)
 
         outputs: BaseModelOutputWithPast = self.model(
