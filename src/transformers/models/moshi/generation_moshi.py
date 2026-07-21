@@ -615,12 +615,14 @@ class MoshiGenerationMixin(GenerationMixin):
         # forced on. They go on the config rather than alongside it: passing generation arguments next to a
         # `generation_config` is deprecated, and doing it here warned on every call.
         # What the caller actually asked for, kept because the checks below distinguish "the caller wanted a dict"
-        # from "beam search needed one".
+        # from "this call needed one anyway".
         caller_wants_dict = generation_config.return_dict_in_generate
-        return_dict_in_generate = generation_config.num_beams > 1 or caller_wants_dict
-        output_scores = generation_config.num_beams > 1 or generation_config.output_scores
-        generation_config.return_dict_in_generate = return_dict_in_generate
-        generation_config.output_scores = output_scores
+        # Always on: the KV cache reaches the streaming state through the base loop's dict output, and a state handed
+        # back without one still resumes -- by re-reading the whole conversation into a fresh cache, which is both
+        # quadratic and, because the mask arithmetic is written for a cache that carries over, not quite the same
+        # audio. A caller who does not ask for a dict gets `sequences` below exactly as before.
+        generation_config.return_dict_in_generate = True
+        generation_config.output_scores = generation_config.num_beams > 1 or generation_config.output_scores
 
         # A caller resuming a stream hands back the KV cache from the previous chunk. `generation_config` asks for
         # a fresh `cache_implementation`, which the base loop refuses to combine with a supplied cache. Clearing it
@@ -649,15 +651,9 @@ class MoshiGenerationMixin(GenerationMixin):
                 self.generation_config.cache_implementation = saved_cache_implementation
 
         if not return_audio_codes:
-            if return_dict_in_generate and not caller_wants_dict:
-                return outputs.sequences
-            return outputs
+            return outputs if caller_wants_dict else outputs.sequences
 
-        # check if outputs is a dict or tokens
-        if not return_dict_in_generate:
-            output_text_ids = outputs
-        else:
-            output_text_ids = outputs.sequences
+        output_text_ids = outputs.sequences
 
         if generation_config.num_return_sequences > 1:
             assistant_delay_pattern_mask = torch.repeat_interleave(
@@ -747,7 +743,7 @@ class MoshiGenerationMixin(GenerationMixin):
         # What a following chunk needs to pick up where this one stopped. Handed back whenever the caller is already
         # streaming, so a session threads it through without asking for it again.
         next_streaming_state = {
-            "past_key_values": getattr(outputs, "past_key_values", None) if return_dict_in_generate else None,
+            "past_key_values": getattr(outputs, "past_key_values", None),
             "user_delay_pattern_mask": kwargs.get("user_delay_pattern_mask"),
             "assistant_delay_pattern_mask": kwargs.get("assistant_delay_pattern_mask"),
             "generated_audio_codes": self.generated_audio_codes,
