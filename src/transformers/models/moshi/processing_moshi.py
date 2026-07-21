@@ -37,16 +37,41 @@ class MoshiProcessorKwargs(ProcessingKwargs, total=False):
 class MoshiProcessor(ProcessorMixin):
     valid_processor_kwargs = MoshiProcessorKwargs
     audio_tokenizer_class = "MimiModel"
+    default_audio_tokenizer = "kyutai/mimi"
 
-    def __init__(self, feature_extractor, tokenizer, audio_tokenizer, num_codebooks=8):
+    def __init__(self, feature_extractor=None, tokenizer=None, audio_tokenizer=None, num_codebooks=8):
         r"""
-        audio_tokenizer (`MimiModel`):
+        feature_extractor (`EncodecFeatureExtractor`, *optional*):
+            Turns raw audio into the model input the codec expects. It belongs to the codec, so when omitted it is
+            fetched from the default codec (`default_audio_tokenizer`), the same as `audio_tokenizer`.
+        tokenizer (`PreTrainedTokenizerFast`):
+            Moshi's own text tokenizer. Unlike the two codec-derived pieces it is specific to the checkpoint, so
+            there is nothing to fall back to -- it is required.
+        audio_tokenizer (`MimiModel`, *optional*):
             The Mimi codec. It turns raw audio into the discrete codes Moshi consumes, and turns generated codes
-            back into audio.
+            back into audio. When omitted -- which is what happens loading a checkpoint saved before the codec was
+            tracked in the processor config -- the default codec (`default_audio_tokenizer`) is fetched, so
+            `MoshiProcessor.from_pretrained(...)` works without hand-assembling the pieces.
         num_codebooks (`int`, *optional*, defaults to 8):
             How many of Mimi's codebooks Moshi uses. Mimi can emit more than Moshi reads, so this is a property of
             the Moshi checkpoint rather than of the codec.
         """
+        if tokenizer is None:
+            raise ValueError(
+                "`tokenizer` is required: it is the model's own text tokenizer, so unlike the codec and its "
+                "feature extractor it cannot be filled in from a default."
+            )
+        # Both codec-derived pieces default to the same codec repo when the caller (or a checkpoint saved without
+        # processor metadata, like the original `kmhf/*` conversions) leaves them out. Local imports: they are only
+        # reached on this fallback, keeping the module import graph free of a codec dependency otherwise.
+        if feature_extractor is None:
+            from ..auto import AutoFeatureExtractor
+
+            feature_extractor = AutoFeatureExtractor.from_pretrained(self.default_audio_tokenizer)
+        if audio_tokenizer is None:
+            from ..mimi import MimiModel
+
+            audio_tokenizer = MimiModel.from_pretrained(self.default_audio_tokenizer)
         self.num_codebooks = num_codebooks
         super().__init__(feature_extractor, tokenizer, audio_tokenizer=audio_tokenizer)
 
