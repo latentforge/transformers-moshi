@@ -27,6 +27,40 @@ from ...utils import auto_docstring, logging
 logger = logging.get_logger(__name__)
 
 
+def _grow_static_cache(past_key_values: Cache, target_length: int, sliding_window: int | None = None) -> None:
+    """Widen a preallocated cache in place so a resumed generation can keep writing past its original end.
+
+    A static cache is sized once, from the `max_length` of the call that created it. A stream resuming from that
+    cache asks for more room than the first chunk ever needed, and a sliding-window layer answers by rolling its
+    oldest entry out -- silently dropping context that is still inside the model's real window. Layers are grown
+    to `target_length` (capped at the window they are actually meant to hold), keeping the entries already written.
+
+    A layer that has already rolled is left alone: its contents are a window offset from the start of the
+    sequence, and the mask arithmetic reads that offset off `max_cache_len`, so widening it there would misplace
+    every cached key. Growing before each chunk keeps a stream from ever reaching that point.
+    """
+    for layer in getattr(past_key_values, "layers", []):
+        max_cache_len = getattr(layer, "max_cache_len", None)
+        if max_cache_len is None or not getattr(layer, "is_initialized", False):
+            continue
+        # A sliding layer is capped at its window, past which rolling is the intended behaviour, not data loss.
+        # The layer folds the window into `max_cache_len` at build time and keeps no record of it, so it is passed in.
+        window = sliding_window if getattr(layer, "is_sliding", False) else None
+        new_length = target_length if window is None else min(target_length, window)
+        if new_length <= max_cache_len or layer.get_seq_length() > max_cache_len:
+            continue
+
+        length = int(layer.get_seq_length())
+        for name in ("keys", "values"):
+            old = getattr(layer, name)
+            new = old.new_zeros((*old.shape[:2], new_length, old.shape[3]))
+            new[:, :, :length] = old[:, :, :length]
+            setattr(layer, name, new)
+            # The address the compiled graph was handed is gone; the new one has to be pinned in its place.
+            torch._dynamo.mark_static_address(new)
+        layer.max_cache_len = new_length
+
+
 @auto_docstring(
     custom_intro="""
     Outputs of [`MoshiForConditionalConditionalGeneration.generate`].
@@ -66,6 +100,12 @@ class MoshiConditionalGenerationGenerateOutput(ModelOutput):
     user_audio_codes (`torch.LongTensor` of shape `(batch_size*num_return_sequences, num_codeooks, sequence_length)`, *optional*):
         The user stream the depth decoder predicted for the frames the caller did not supply. Only present when the
         depth decoder predicts both streams and the caller left part of the horizon open.
+    streaming_state (`dict`, *optional*):
+        The state needed to resume generation on a following chunk of user audio. Pass it back as
+        `generate(..., streaming_state=...)` to continue where this call left off instead of re-running the whole
+        conversation. It carries the KV cache, the delay-pattern masks (otherwise rebuilt from scratch and never
+        exposed), the undelayed audio histories and the last hidden state -- everything the loop would otherwise
+        re-derive from the prompt.
     """
 
     sequences: torch.LongTensor | None = None
@@ -78,6 +118,7 @@ class MoshiConditionalGenerationGenerateOutput(ModelOutput):
     past_key_values: Cache | None = None
     audio_codes: torch.LongTensor | None = None
     user_audio_codes: torch.LongTensor | None = None
+    streaming_state: dict | None = None
 
 
 @auto_docstring
@@ -270,6 +311,7 @@ class MoshiGenerationMixin(GenerationMixin):
         inputs_embeds: torch.FloatTensor | None = None,
         return_audio_codes: bool | None = True,
         concat_unconditional_inputs: bool | None = True,
+        streaming_state: dict | None = None,
         **kwargs,
     ) -> torch.LongTensor:
         """
@@ -324,6 +366,29 @@ class MoshiGenerationMixin(GenerationMixin):
         # needs to prepare generation config, even though it'll be done again in `generate`
         generation_config, kwargs = self._prepare_generation_config(kwargs.pop("generation_config", None), **kwargs)
 
+        # Resuming a stream: everything the loop would otherwise re-derive from the prompt comes from the previous
+        # chunk instead. Re-deriving it is what makes a split generation disagree with a single-shot one -- the
+        # histories get re-seeded and the delay masks rebuilt, so the boundary lands on a different footing.
+        if streaming_state is not None:
+            concat_unconditional_inputs = False
+            kwargs.setdefault("past_key_values", streaming_state["past_key_values"])
+            # The chunk that opened the stream went through `concat_unconditional_inputs`, which prepends a frame to
+            # every stream, so the histories and masks carried over all sit one frame ahead of the raw user audio the
+            # caller keeps handing back from the start of the conversation. That frame is prepended again here to put
+            # the two on the same footing: without it the delay pattern is rebuilt a frame early, and every user frame
+            # from the resume onwards reaches the model one step before it should.
+            if user_audio_codes is not None:
+                unconditional_user_audio_codes = self.get_unconditional_inputs(
+                    num_samples=user_audio_codes.shape[0]
+                ).user_audio_codes
+                user_audio_codes = torch.cat(
+                    [unconditional_user_audio_codes.to(user_audio_codes.device), user_audio_codes], dim=2
+                )
+            # Kept for the masks below, which are extended once the horizon of this chunk is known. What the caller
+            # handed over has to be told apart from what `_check_and_maybe_initialize_inputs` fills in for a silent
+            # side: only real audio belongs in the user mask, a filler stream has to stay open for prediction.
+            resumed_user_audio_codes = user_audio_codes
+
         input_ids, user_audio_codes, assistant_audio_codes, concat_unconditional_inputs = (
             self._check_and_maybe_initialize_inputs(
                 input_ids=input_ids,
@@ -346,6 +411,13 @@ class MoshiGenerationMixin(GenerationMixin):
         # decoder's own predictions -- the rest is just the caller's input handed back.
         prompt_frames = assistant_audio_codes.shape[-1] if assistant_audio_codes is not None else 0
         supplied_frames = user_audio_codes.shape[-1] if user_audio_codes is not None else 0
+        if streaming_state is not None:
+            # The count runs over the whole stream, not this chunk: the prompt it is measured against is the one the
+            # stream opened on, and the frames it counts are the ones the caller has sent since -- not the silent
+            # placeholder a side that never speaks is initialized with, which is no one's input.
+            prompt_frames = streaming_state["prompt_frames"]
+            supplied_frames = resumed_user_audio_codes.shape[-1] if resumed_user_audio_codes is not None else 0
+        self._prompt_frames = prompt_frames
         self._user_supplied_steps = max(supplied_frames - prompt_frames, 0)
 
         inputs = inputs_embeds if input_ids is None else input_ids
@@ -361,6 +433,50 @@ class MoshiGenerationMixin(GenerationMixin):
             inputs_tensor=inputs,
             input_ids_length=input_ids_length,
         )
+        # Kept for the cache sizing below, which happens after `max_length` is handed back unresolved.
+        resolved_max_length = generation_config.max_length
+
+        # The masks carried over were built for the horizon of the chunk that made them, which this one runs past.
+        # They are read at absolute positions, so they have to reach both the end of this chunk and the end of
+        # whatever user audio came with it. The assistant's is opened up with `-1` -- "predict here" -- and so is the
+        # user's when the caller sent no audio. When it did, `-1` would mean the opposite of what happened, since it
+        # tells the loop to fall back to a prediction and would silently drop the audio that just arrived: those
+        # frames are written into the mask so they are forced, exactly as a cold call handed the whole stream would
+        # have done.
+        if streaming_state is not None:
+            horizon = resolved_max_length
+            if resumed_user_audio_codes is not None:
+                horizon = max(horizon, resumed_user_audio_codes.shape[-1])
+
+            assistant_mask = streaming_state["assistant_delay_pattern_mask"]
+            if assistant_mask is not None:
+                assistant_mask = self.extend_delay_pattern_mask(assistant_mask, horizon)
+            kwargs.setdefault("assistant_delay_pattern_mask", assistant_mask)
+
+            user_mask = streaming_state["user_delay_pattern_mask"]
+            if user_mask is not None and horizon > user_mask.shape[-1]:
+                if resumed_user_audio_codes is None:
+                    user_mask = self.extend_delay_pattern_mask(user_mask, horizon)
+                else:
+                    # Rebuilt from the whole stream, which is what a cold call handed the same audio would have
+                    # built. Only the tail is taken from it, so the frames already decided keep the layout they went
+                    # through. Built one frame past the horizon and then cut back to it: `build_delay_pattern_mask`
+                    # closes the first codebook with a pad, spending the last slot on it and dropping the frame that
+                    # belonged there. That is right when the horizon really is the end, but a stream that carries on
+                    # needs the audio, so the pad is pushed one past the end and sliced off with it.
+                    _, rebuilt = self.build_delay_pattern_mask(
+                        resumed_user_audio_codes,
+                        bos_token_id=self.config.audio_vocab_size,
+                        pad_token_id=self.config.audio_vocab_size,
+                        max_length=horizon + 1,
+                    )
+                    rebuilt = rebuilt[..., :horizon]
+                    keep = user_mask.shape[-1]
+                    user_mask = rebuilt.clone()
+                    # Everything already decided keeps the layout it went through, except the slot the previous
+                    # horizon's pad was sitting on -- real audio here, so it comes from the rebuild too.
+                    user_mask[..., : keep - 1] = streaming_state["user_delay_pattern_mask"][..., : keep - 1]
+            kwargs.setdefault("user_delay_pattern_mask", user_mask)
 
         # Moshi is full-duplex and consumes a user frame at every step. A depth decoder that predicts the user
         # stream can fill in whatever the caller did not supply; one that only predicts Moshi's own stream cannot,
@@ -418,7 +534,14 @@ class MoshiGenerationMixin(GenerationMixin):
             attention_mask,
         ) = self._prepare_inputs_embeds_for_generation(
             input_ids=input_ids,
-            user_audio_codes=user_audio_codes,
+            # A resumed prefill re-reads the frames the previous chunk already decided, so it has to read them from
+            # the same place the loop does: its own user history, which carries the depth decoder's predictions for
+            # a stream the caller never sent. The caller's raw audio would only line up where the mask forces it,
+            # and a self-playing checkpoint has no mask to force -- it would prefill on the silent placeholder
+            # `_check_and_maybe_initialize_inputs` fills in and throw away everything the user side has said.
+            user_audio_codes=streaming_state["generated_user_codes"]
+            if streaming_state is not None
+            else user_audio_codes,
             assistant_audio_codes=assistant_audio_codes,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -437,7 +560,11 @@ class MoshiGenerationMixin(GenerationMixin):
         generation_config.max_length = None
 
         # set delay pattern mask for the rest of the generation
-        self.generated_user_audio_codes = None
+        # The predicted user stream is returned whole, like the assistant one: a resumed chunk carries over what the
+        # earlier chunks predicted instead of returning only its own slice of the conversation.
+        self.generated_user_audio_codes = (
+            streaming_state["generated_user_audio_codes"] if streaming_state is not None else None
+        )
         kwargs["user_delay_pattern_mask"] = (
             user_delay_pattern_mask if user_delay_pattern_mask is not None else kwargs.get("user_delay_pattern_mask")
         )
@@ -447,11 +574,16 @@ class MoshiGenerationMixin(GenerationMixin):
             else kwargs.get("assistant_delay_pattern_mask")
         )
 
-        # Undelayed, matching how the loop extends it below.
-        self.generated_audio_codes = torch.repeat_interleave(
-            undelayed_assistant_audio_codes,
-            max(generation_config.num_beams, generation_config.num_return_sequences),
-            dim=0,
+        # Undelayed, matching how the loop extends it below. A resumed stream carries its history over instead:
+        # re-seeding from the prompt would drop whatever the previous chunk appended.
+        self.generated_audio_codes = (
+            streaming_state["generated_audio_codes"]
+            if streaming_state is not None
+            else torch.repeat_interleave(
+                undelayed_assistant_audio_codes,
+                max(generation_config.num_beams, generation_config.num_return_sequences),
+                dim=0,
+            )
         )
         # The user stream needs its own undelayed history for the same reason the assistant one does: the delay
         # pattern reads codebook `k` of a frame from `k` frames back, so applying it to the wrong stream's history
@@ -465,11 +597,19 @@ class MoshiGenerationMixin(GenerationMixin):
             if undelayed_user_audio_codes is not None
             else torch.zeros_like(undelayed_assistant_audio_codes)
         )
-        self.generated_user_codes = torch.repeat_interleave(
-            user_history,
-            max(generation_config.num_beams, generation_config.num_return_sequences),
-            dim=0,
+        self.generated_user_codes = (
+            streaming_state["generated_user_codes"]
+            if streaming_state is not None
+            else torch.repeat_interleave(
+                user_history,
+                max(generation_config.num_beams, generation_config.num_return_sequences),
+                dim=0,
+            )
         )
+        if streaming_state is not None:
+            # The depth decoder reads the frame the previous chunk ended on, so its hidden state has to survive the
+            # boundary; recomputing it from the prompt would give the frame before it.
+            self.last_hidden_state = streaming_state["last_hidden_state"]
 
         # Beam search needs the scores and the beam indices to reorder the audio history afterwards, so both are
         # forced on. They go on the config rather than alongside it: passing generation arguments next to a
@@ -482,14 +622,31 @@ class MoshiGenerationMixin(GenerationMixin):
         generation_config.return_dict_in_generate = return_dict_in_generate
         generation_config.output_scores = output_scores
 
-        outputs = super().generate(
-            inputs_embeds=inputs_embeds,
-            input_ids=input_ids,
-            generation_config=generation_config,
-            kwargs_depth_decoder=kwargs_depth_decoder,
-            attention_mask=attention_mask,
-            **kwargs,
-        )
+        # A caller resuming a stream hands back the KV cache from the previous chunk. `generation_config` asks for
+        # a fresh `cache_implementation`, which the base loop refuses to combine with a supplied cache. Clearing it
+        # on `generation_config` alone is not enough: the base re-fills any `None` field from
+        # `self.generation_config`, so the model default is cleared for the call and restored right after.
+        resuming = kwargs.get("past_key_values") is not None
+        saved_cache_implementation = self.generation_config.cache_implementation
+        if resuming:
+            generation_config.cache_implementation = None
+            self.generation_config.cache_implementation = None
+            # That cache was sized for the chunk that built it, which is shorter than the stream it is now carrying.
+            _grow_static_cache(
+                kwargs["past_key_values"], resolved_max_length, getattr(self.config, "sliding_window", None)
+            )
+        try:
+            outputs = super().generate(
+                inputs_embeds=inputs_embeds,
+                input_ids=input_ids,
+                generation_config=generation_config,
+                kwargs_depth_decoder=kwargs_depth_decoder,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+        finally:
+            if resuming:
+                self.generation_config.cache_implementation = saved_cache_implementation
 
         if not return_audio_codes:
             if return_dict_in_generate and not caller_wants_dict:
@@ -540,10 +697,28 @@ class MoshiGenerationMixin(GenerationMixin):
             **kwargs_depth_decoder,
         )
 
-        # Drop the leading text token, then keep only Moshi's own codebooks.
-        last_generated_audio_codes, _ = self._split_predicted_streams(last_generated_audio_codes[:, 1:].unsqueeze(2))
+        # Drop the leading text token, then split the frame into the two streams.
+        last_generated_audio_codes, last_generated_user_codes = self._split_predicted_streams(
+            last_generated_audio_codes[:, 1:].unsqueeze(2)
+        )
 
         self.generated_audio_codes = torch.cat([self.generated_audio_codes, last_generated_audio_codes], dim=2)
+        # The user history has to grow with it. The loop keeps the two the same length and reads them at the same
+        # index, so a user stream left a frame short here lags one frame behind the assistant one for the whole of
+        # a resumed stream. Where the depth decoder predicts no user stream the placeholder is zeros, exactly as in
+        # the loop -- `user_delay_pattern_mask` writes the caller's own frame over it wherever there is one.
+        if last_generated_user_codes is None:
+            last_generated_user_codes = self.generated_user_codes.new_zeros((*self.generated_user_codes.shape[:2], 1))
+        else:
+            # The returned prediction gets this frame too, for the same reason the assistant stream does: the two
+            # are decoded side by side, and a user stream a frame short of the assistant one drifts out of sync --
+            # by a whole frame per chunk once a caller is streaming.
+            self.generated_user_audio_codes = (
+                last_generated_user_codes
+                if self.generated_user_audio_codes is None
+                else torch.cat([self.generated_user_audio_codes, last_generated_user_codes], dim=2)
+            )
+        self.generated_user_codes = torch.cat([self.generated_user_codes, last_generated_user_codes], dim=2)
 
         # The history is already what the caller wants: the depth decoder emits a whole frame at a time, and the
         # delay is applied only where the codes are fed back in. Applying it here and slicing it off again would
@@ -569,13 +744,32 @@ class MoshiGenerationMixin(GenerationMixin):
             predicted = self.generated_user_audio_codes[:, :, self._user_supplied_steps :]
             output_user_audio_codes = predicted if predicted.shape[-1] > 0 else None
 
+        # What a following chunk needs to pick up where this one stopped. Handed back whenever the caller is already
+        # streaming, so a session threads it through without asking for it again.
+        next_streaming_state = {
+            "past_key_values": getattr(outputs, "past_key_values", None) if return_dict_in_generate else None,
+            "user_delay_pattern_mask": kwargs.get("user_delay_pattern_mask"),
+            "assistant_delay_pattern_mask": kwargs.get("assistant_delay_pattern_mask"),
+            "generated_audio_codes": self.generated_audio_codes,
+            "generated_user_codes": self.generated_user_codes,
+            "generated_user_audio_codes": self.generated_user_audio_codes,
+            "last_hidden_state": self.last_hidden_state,
+            "prompt_frames": self._prompt_frames,
+        }
+
         if caller_wants_dict:
             return MoshiConditionalGenerationGenerateOutput(
-                audio_codes=output_audio_codes, user_audio_codes=output_user_audio_codes, **outputs
+                audio_codes=output_audio_codes,
+                user_audio_codes=output_user_audio_codes,
+                streaming_state=next_streaming_state,
+                **outputs,
             )
 
         return MoshiConditionalGenerationGenerateOutput(
-            sequences=output_text_ids, audio_codes=output_audio_codes, user_audio_codes=output_user_audio_codes
+            sequences=output_text_ids,
+            audio_codes=output_audio_codes,
+            user_audio_codes=output_user_audio_codes,
+            streaming_state=next_streaming_state,
         )
 
     def prepare_inputs_for_generation(
@@ -693,6 +887,31 @@ class MoshiGenerationMixin(GenerationMixin):
         # dirty, but we need to make a last depth_decoder.generate
         self.last_hidden_state = last_hidden_state
         return model_kwargs
+
+    @staticmethod
+    def extend_delay_pattern_mask(decoder_pad_token_mask, max_length: int, pad_token_id: int | None = None):
+        """
+        Stretch a delay-pattern mask to a longer horizon, for a stream that has run past the one it was built for.
+
+        A mask is built once for a fixed `max_length` (see `build_delay_pattern_mask`), which a chunked caller does
+        not know up front: each chunk pushes the horizon out. Only two entries in it are horizon-dependent -- the
+        pad closing the first codebook, and the length itself. The rest is either a prompt value or `-1`, meaning
+        "keep whatever is passed", which is exactly right for the frames that have not arrived yet.
+
+        The pad is lifted and, unless `pad_token_id` says otherwise, not written again: it marks the end of a
+        generation, and a stream that is being extended has not reached one. Left in place it would force a pad onto
+        a slot that is about to hold real audio.
+        """
+        current_length = decoder_pad_token_mask.shape[-1]
+        if current_length >= max_length:
+            return decoder_pad_token_mask
+
+        extended = decoder_pad_token_mask.new_full((*decoder_pad_token_mask.shape[:-1], max_length), -1)
+        extended[..., :current_length] = decoder_pad_token_mask
+        extended[:, 0, current_length - 1] = -1
+        if pad_token_id is not None:
+            extended[:, 0, -1] = pad_token_id
+        return extended
 
     @staticmethod
     def apply_delay_pattern_mask(input_ids, decoder_pad_token_mask):

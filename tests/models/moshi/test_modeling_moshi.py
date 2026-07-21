@@ -911,6 +911,124 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
                 )
             previous_history, previous_codes = history.clone(), output.audio_codes.clone()
 
+    def _generate_in_chunks(self, model, inputs, max_new_tokens, chunk, user=None, **kwargs):
+        """Drive `generate` `chunk` steps at a time, threading `streaming_state` through, and return the last output."""
+        state, output, produced = None, None, 0
+        while produced < max_new_tokens:
+            steps = min(chunk, max_new_tokens - produced)
+            produced += steps
+            # A streaming caller only ever has the audio that has arrived so far -- just enough to reach the horizon
+            # of the chunk it is asking for, counting the frame `concat_unconditional_inputs` prepended.
+            chunk_kwargs = {} if user is None else {"user_audio_codes": user[..., : produced + 2]}
+            if state is None:
+                output = model.generate(
+                    input_ids=inputs.input_ids,
+                    assistant_audio_codes=inputs.assistant_audio_codes,
+                    max_new_tokens=steps,
+                    min_new_tokens=steps,
+                    concat_unconditional_inputs=True,
+                    do_sample=False,
+                    depth_decoder_do_sample=False,
+                    return_dict_in_generate=True,
+                    **chunk_kwargs,
+                    **kwargs,
+                )
+            else:
+                output = model.generate(
+                    input_ids=output.sequences,
+                    assistant_audio_codes=state["generated_audio_codes"],
+                    max_new_tokens=steps,
+                    min_new_tokens=steps,
+                    do_sample=False,
+                    depth_decoder_do_sample=False,
+                    return_dict_in_generate=True,
+                    streaming_state=state,
+                    **chunk_kwargs,
+                    **kwargs,
+                )
+            state = output.streaming_state
+        return output
+
+    def _assert_matches_single_shot(self, output, reference, message):
+        self.assertEqual(output.sequences.shape, reference.sequences.shape, message)
+        self.assertTrue((output.sequences == reference.sequences).all(), f"{message}: text")
+        self.assertEqual(output.audio_codes.shape, reference.audio_codes.shape, message)
+        self.assertTrue((output.audio_codes == reference.audio_codes).all(), f"{message}: audio codes")
+        if reference.user_audio_codes is None:
+            self.assertIsNone(output.user_audio_codes, message)
+        else:
+            self.assertEqual(output.user_audio_codes.shape, reference.user_audio_codes.shape, message)
+            self.assertTrue((output.user_audio_codes == reference.user_audio_codes).all(), f"{message}: user codes")
+
+    def test_generate_resumed_from_streaming_state_matches_single_shot(self):
+        """
+        Handing `streaming_state` back has to put the next chunk on exactly the footing the loop was on, so a
+        generation split into chunks comes out identical to the same generation run in one go. Every part of the
+        carried state is load-bearing and fails quietly on its own: a cache preallocated for the first chunk rolls
+        real context out from under the ones that follow, a delay mask rebuilt on the raw user stream feeds every
+        frame a step early, and a user history left a frame short of the assistant one lags for the rest of the
+        stream. None of that changes a shape or raises -- it just degrades what comes out, chunk by chunk.
+        """
+        config = self.model_tester.get_config()
+        model = MoshiForConditionalGeneration(config).to(torch_device).eval()
+
+        max_new_tokens = 9
+        num_user_frames = max_new_tokens + 2
+        user = torch.arange(config.num_codebooks * num_user_frames, device=torch_device, dtype=torch.int64)
+        user = (user % config.audio_vocab_size).reshape(1, config.num_codebooks, num_user_frames)
+        inputs = model.get_unconditional_inputs(num_samples=1)
+
+        for cache_implementation in (None, "static"):
+            # A static cache is sized from the `max_length` of the call that built it, which a resumed stream runs
+            # past -- it has to be grown rather than left to roll its oldest entries out.
+            cache_kwargs = {} if cache_implementation is None else {"cache_implementation": cache_implementation}
+            reference = model.generate(
+                input_ids=inputs.input_ids,
+                assistant_audio_codes=inputs.assistant_audio_codes,
+                user_audio_codes=user,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=max_new_tokens,
+                concat_unconditional_inputs=True,
+                do_sample=False,
+                depth_decoder_do_sample=False,
+                return_dict_in_generate=True,
+                **cache_kwargs,
+            )
+            for chunk in (1, 2, 4):
+                output = self._generate_in_chunks(model, inputs, max_new_tokens, chunk, user=user, **cache_kwargs)
+                self._assert_matches_single_shot(
+                    output, reference, f"{chunk}-step chunks, cache_implementation={cache_implementation}"
+                )
+
+    def test_generate_resumed_from_streaming_state_matches_single_shot_when_self_playing(self):
+        """
+        Same contract with no user audio at all, where the depth decoder plays both sides. Here the resumed prefill
+        has nothing but its own history to re-read the frames it already decided from: the caller sent no stream and
+        the delay mask has nothing to force, so falling back to the placeholder a silent side is initialized with
+        throws away everything the user side has said.
+        """
+        config = self.model_tester.get_config()
+        model = MoshiForConditionalGeneration(config).to(torch_device).eval()
+        self.assertTrue(model.predicts_user_stream, "the model has to play both sides for this test to mean anything")
+
+        max_new_tokens = 9
+        inputs = model.get_unconditional_inputs(num_samples=1)
+        reference = model.generate(
+            input_ids=inputs.input_ids,
+            assistant_audio_codes=inputs.assistant_audio_codes,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=max_new_tokens,
+            concat_unconditional_inputs=True,
+            do_sample=False,
+            depth_decoder_do_sample=False,
+            return_dict_in_generate=True,
+        )
+        self.assertIsNotNone(reference.user_audio_codes, "the depth decoder should have filled the user stream")
+
+        for chunk in (1, 2, 4):
+            output = self._generate_in_chunks(model, inputs, max_new_tokens, chunk)
+            self._assert_matches_single_shot(output, reference, f"{chunk}-step chunks, self-playing")
+
     def test_generate_fills_short_user_stream_when_predicting_user_stream(self):
         config = self.model_tester.get_config()
         model = MoshiForConditionalGeneration(config).to(torch_device).eval()
@@ -930,17 +1048,16 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
 
         # the frames the caller did not provide come back as `user_audio_codes`, one per depth decoder step
         self.assertIsNotNone(output.user_audio_codes)
-        self.assertEqual(output.user_audio_codes.shape, (1, config.num_codebooks, max_new_tokens - 1))
+        self.assertEqual(output.user_audio_codes.shape, (1, config.num_codebooks, max_new_tokens))
 
-        # The two streams are frame-aligned from the start, not at the end: `user_audio_codes[..., i]` is the
-        # frame Moshi heard while speaking `audio_codes[..., i]`. Moshi's own stream runs one frame longer
-        # because the closing depth decoder pass extends only that stream. The prompt frame is absent from
-        # `audio_codes` here because it is the reserved "has not spoken yet" id, which is trimmed on the way out.
+        # The two streams are frame-aligned: `user_audio_codes[..., i]` is the frame Moshi heard while speaking
+        # `audio_codes[..., i]`, closing depth decoder pass included -- it extends both. The prompt frame is absent
+        # from `audio_codes` here because it is the reserved "has not spoken yet" id, trimmed on the way out.
         self.assertEqual(output.audio_codes.shape, (1, config.num_codebooks, max_new_tokens))
         self.assertEqual(
-            output.user_audio_codes.shape[-1] + 1,
+            output.user_audio_codes.shape[-1],
             output.audio_codes.shape[-1],
-            "the user stream should track Moshi's own stream, trailing it by the closing depth decoder pass",
+            "the user stream should stay frame-aligned with Moshi's own stream",
         )
 
 
