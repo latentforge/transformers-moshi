@@ -440,6 +440,57 @@ class MimiIntegrationTest(unittest.TestCase):
 
         torch.testing.assert_close(streamed_audio_codes, audio_codes)
 
+    def test_integration_decode_with_padding_cache(self):
+        """
+        The mirror of `test_integration_encode_with_padding_cache`, for the way back.
+
+        Decoding a stream chunk by chunk has to give the waveform decoding it in one go gives. Without the cache
+        it does not come close: the decoder's convolutions restart from silence at every chunk, and its transposed
+        convolutions drop the tail of every chunk's output rather than carrying it into the next one, which leaves
+        an error several times the size of the signal -- not a seam at the boundaries but a broken waveform.
+
+        This test must be run on CPU since GPU floating point operations accumulate rounding errors that cause test failures.
+        """
+        librispeech_dummy = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+
+        model_id = "kyutai/mimi"
+
+        model = MimiModel.from_pretrained(model_id, use_cache=True).to("cpu")
+        processor = AutoFeatureExtractor.from_pretrained(model_id)
+
+        librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=processor.sampling_rate))
+        audio_sample = librispeech_dummy[-1]["audio"]["array"]
+
+        inputs = processor(
+            raw_audio=audio_sample,
+            sampling_rate=processor.sampling_rate,
+            return_tensors="pt",
+        ).to("cpu")
+
+        with torch.no_grad():
+            audio_codes = model.encode(inputs["input_values"]).audio_codes
+            audio_values = model.decode(audio_codes).audio_values
+
+            for chunk_frames in (1, 5):
+                decoder_past_key_values, padding_cache, chunks = None, None, []
+                for start in range(0, audio_codes.shape[-1], chunk_frames):
+                    decoder_outputs = model.decode(
+                        audio_codes[:, :, start : start + chunk_frames],
+                        decoder_past_key_values=decoder_past_key_values,
+                        padding_cache=padding_cache,
+                        use_streaming=True,
+                    )
+                    decoder_past_key_values = decoder_outputs.decoder_past_key_values
+                    padding_cache = decoder_outputs.padding_cache
+                    chunks.append(decoder_outputs.audio_values)
+
+                streamed_audio_values = torch.cat(chunks, dim=-1)
+                self.assertEqual(streamed_audio_values.shape, audio_values.shape)
+                rmse = compute_rmse(
+                    streamed_audio_values.squeeze().cpu().numpy(), audio_values.squeeze().cpu().numpy()
+                )
+                self.assertTrue(rmse < 1e-4, f"{chunk_frames}-frame chunks drifted from a single decode: {rmse}")
+
     def test_integration(self):
         expected_rmses = {
             "8": 0.0018785292,
