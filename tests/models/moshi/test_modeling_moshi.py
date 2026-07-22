@@ -27,6 +27,7 @@ from transformers import (
     MoshiConfig,
     PreTrainedConfig,
 )
+from transformers.models.moshi.generation_moshi import MoshiStreamingState
 from transformers.integrations.deepspeed import (
     is_deepspeed_available,
     is_deepspeed_zero3_enabled,
@@ -800,11 +801,24 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
         super().test_save_load()
 
     @pytest.mark.generate
-    @unittest.skip(reason="Moshi requires setting `model.generated_audio_codes` in generate() before preparing inputs")
     def test_prepare_inputs_for_generation_kwargs_forwards(self):
-        # If in the future `model.generated_audio_codes` is not required, this test can be re-enabled
+        # Moshi runs the depth decoder inside this hook, so it needs the state the generation loop would have been
+        # carrying: the two audio histories and their delay patterns. It reads one frame per row, folding the step
+        # axis of the base test's `(2, 3)` `input_ids` into the batch, hence the six rows here.
+        config = self.model_tester.get_config()
+        rows = 2 * 3
+        codes = torch.zeros((rows, config.num_codebooks, 1), dtype=torch.int64, device=torch_device)
+        mask = torch.full((rows, config.num_codebooks, 4), -1, dtype=torch.int64, device=torch_device)
+        num_depth_codebooks = config.depth_decoder_config.num_codebooks
         super().test_prepare_inputs_for_generation_kwargs_forwards(
-            last_hidden_state=torch.randn(2, 3, 32), kwargs_depth_decoder={}
+            last_hidden_state=torch.randn(2, 3, config.hidden_size, device=torch_device),
+            kwargs_depth_decoder={
+                "min_length": num_depth_codebooks + 1,
+                "max_length": num_depth_codebooks + 1,
+            },
+            streaming_state=MoshiStreamingState(assistant_audio_codes=codes, user_audio_codes=codes.clone()),
+            user_delay_pattern_mask=mask,
+            assistant_delay_pattern_mask=mask.clone(),
         )
 
     @unittest.skip(reason="Moshi has no separate base model without a head.")
@@ -896,7 +910,7 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
                 depth_decoder_do_sample=False,
             )
             text = output.sequences
-            history = model.generated_audio_codes.clone()
+            history = output.streaming_state.assistant_audio_codes.clone()
 
             if previous_history is not None:
                 kept = previous_history.shape[-1]
@@ -916,10 +930,14 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
         state, output, produced = None, None, 0
         while produced < max_new_tokens:
             steps = min(chunk, max_new_tokens - produced)
-            produced += steps
-            # A streaming caller only ever has the audio that has arrived so far -- just enough to reach the horizon
-            # of the chunk it is asking for, counting the frame `concat_unconditional_inputs` prepended.
-            chunk_kwargs = {} if user is None else {"user_audio_codes": user[..., : produced + 2]}
+            # A streaming caller only ever hands over the audio that has arrived since the last chunk -- just
+            # enough to reach the horizon it is asking for, counting the frame prepended when the stream opened.
+            first, produced = produced, produced + steps
+            chunk_kwargs = (
+                {}
+                if user is None
+                else {"user_audio_codes": user[..., (0 if state is None else first + 2) : produced + 2]}
+            )
             if state is None:
                 output = model.generate(
                     input_ids=inputs.input_ids,
@@ -934,9 +952,8 @@ class MoshiTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
                     **kwargs,
                 )
             else:
+                # Nothing but the new audio: the conversation so far is on the state.
                 output = model.generate(
-                    input_ids=output.sequences,
-                    assistant_audio_codes=state["generated_audio_codes"],
                     max_new_tokens=steps,
                     min_new_tokens=steps,
                     do_sample=False,
