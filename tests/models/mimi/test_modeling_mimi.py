@@ -455,7 +455,10 @@ class MimiIntegrationTest(unittest.TestCase):
 
         model_id = "kyutai/mimi"
 
-        model = MimiModel.from_pretrained(model_id, use_cache=True).to("cpu")
+        # Deliberately not `use_cache=True`: the checkpoint leaves it off, and `decode` is what has to turn the
+        # decoder transformer's cache on for a stream. Forcing it here would hide whether it does.
+        model = MimiModel.from_pretrained(model_id).to("cpu")
+        self.assertFalse(model.config.use_cache, "the test only means something while the default is off")
         processor = AutoFeatureExtractor.from_pretrained(model_id)
 
         librispeech_dummy = librispeech_dummy.cast_column("audio", Audio(sampling_rate=processor.sampling_rate))
