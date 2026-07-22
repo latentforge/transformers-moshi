@@ -164,6 +164,42 @@ class MimiConv1dPaddingCache:
         return current_cache
 
 
+class MimiDecoderPaddingCache(MimiConv1dPaddingCache):
+    """
+    Padding cache for the decoder, which streams two kinds of convolution rather than one.
+
+    Its `MimiConv1d` layers cache padding exactly as the encoder's do, and that part is inherited. Its
+    `MimiConvTranspose1d` layers need something else: a transposed convolution spreads every input step over
+    `kernel_size` output steps, so the last `kernel_size - stride` steps it writes are only partly finished --
+    the input that would complete them has not arrived yet. Run over a whole sequence they are simply trimmed
+    off the end. Run over a chunk they are the *start* of the next chunk's output, and have to be carried and
+    added to it, or the waveform steps down to a partial sum at every chunk boundary.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        per_layer_padding: list[int],
+        per_layer_padding_mode: list[str],
+        per_layer_in_channels: list[int],
+        num_transpose_layers: int,
+    ):
+        super().__init__(num_layers, per_layer_padding, per_layer_padding_mode, per_layer_in_channels)
+        self.overlap_cache = [None] * num_transpose_layers
+
+    def get_overlap(self, layer_idx: int):
+        """
+        Return the unfinished tail the previous call to the transposed convolution `layer_idx` left behind, or
+        `None` at the start of a stream. It is read before the new tail is known, since the new one is what the
+        old one has been added into.
+        """
+        return self.overlap_cache[layer_idx]
+
+    def set_overlap(self, overlap_states: torch.Tensor, layer_idx: int):
+        """Keep the tail of this call's output, of length `kernel_size - stride`, for the next one."""
+        self.overlap_cache[layer_idx] = overlap_states
+
+
 @auto_docstring
 @dataclass
 class MimiEncoderOutput(ModelOutput):
@@ -201,10 +237,14 @@ class MimiDecoderOutput(ModelOutput):
 
         If `past_key_values` are used, the user can optionally input only the last `audio_values` or `audio_codes (those that don't
         have their past key value states given to this model).
+    padding_cache (`MimiDecoderPaddingCache`, *optional*):
+        Convolution state for the decoder, carrying both the causal padding its `MimiConv1d` layers need and the
+        unfinished output its `MimiConvTranspose1d` layers leave behind, in order to support streaming.
     """
 
     audio_values: torch.FloatTensor | None = None
     decoder_past_key_values: Cache | None = None
+    padding_cache: MimiDecoderPaddingCache | None = None
 
 
 class MimiConv1d(nn.Module):
@@ -358,11 +398,13 @@ class MimiConvTranspose1d(nn.Module):
         kernel_size: int,
         stride: int = 1,
         groups: int = 1,
-        bias=True,
+        bias: bool = True,
+        layer_idx: int | None = None,
     ):
         super().__init__()
         self.causal = config.use_causal_conv
         self.trim_right_ratio = config.trim_right_ratio
+        self.layer_idx = layer_idx
         self.conv = nn.ConvTranspose1d(in_channels, out_channels, kernel_size, stride, groups=groups, bias=bias)
 
         if not (self.causal or self.trim_right_ratio == 1.0):
@@ -396,13 +438,35 @@ class MimiConvTranspose1d(nn.Module):
     def remove_weight_norm(self):
         nn.utils.remove_weight_norm(self.conv)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, padding_cache=None):
+        if not self.causal and padding_cache is not None:
+            raise ValueError("`padding_cache` is not supported for non-causal convolutions.")
+
         hidden_states = self.conv(hidden_states)
 
-        # unpad
-        end = hidden_states.shape[-1] - self.padding_right
-        hidden_states = hidden_states[..., self.padding_left : end]
-        return hidden_states
+        if padding_cache is None:
+            # unpad
+            end = hidden_states.shape[-1] - self.padding_right
+            return hidden_states[..., self.padding_left : end]
+
+        # The right padding is not padding at all: those steps are a partial sum that the input still to come
+        # would have finished. Over a whole sequence they are past the end and get thrown away, but a chunk is
+        # not the end -- they are the first steps of the next chunk's output, and are added onto it there.
+        overlap = self.padding_right
+        if overlap == 0:
+            return hidden_states
+
+        previous_overlap = padding_cache.get_overlap(self.layer_idx)
+        if previous_overlap is not None:
+            hidden_states = hidden_states.clone()
+            hidden_states[..., :overlap] += previous_overlap
+            if self.conv.bias is not None:
+                # Both halves of the sum carry the bias, and a finished step is only owed it once.
+                hidden_states[..., :overlap] -= self.conv.bias.view(1, -1, 1)
+        # Taken after the sum, not before: a chunk short enough that its output does not clear the overlap leaves
+        # a tail that is still only partly finished, and what was added above has to carry on into it.
+        padding_cache.set_overlap(hidden_states[..., -overlap:], self.layer_idx)
+        return hidden_states[..., :-overlap]
 
 
 class MimiResnetBlock(nn.Module):
@@ -944,28 +1008,45 @@ class MimiDecoder(nn.Module):
         scaling = int(2 ** len(config.upsampling_ratios))
         model = [MimiConv1d(config, config.hidden_size, scaling * config.num_filters, config.kernel_size)]
 
+        # keep track of submodule layer names for easy streaming cache construction, as the encoder does
+        mimiconv1d_layer_names = ["layers.0"]
+        mimiconvtranspose1d_layer_names = []
+
         # Upsample to raw audio scale
         for ratio in config.upsampling_ratios:
             current_scale = scaling * config.num_filters
             # Add upsampling layers
             model += [nn.ELU()]
+            mimiconvtranspose1d_layer_names.append(f"layers.{len(model)}")
             model += [
                 MimiConvTranspose1d(config, current_scale, current_scale // 2, kernel_size=ratio * 2, stride=ratio)
             ]
             # Add residual layers
             for j in range(config.num_residual_layers):
+                mimiconv1d_layer_names.extend([f"layers.{len(model)}.block.1", f"layers.{len(model)}.block.3"])
                 model += [MimiResnetBlock(config, current_scale // 2, (config.dilation_growth_rate**j, 1))]
             scaling //= 2
 
         # Add final layers
         model += [nn.ELU()]
+        mimiconv1d_layer_names.append(f"layers.{len(model)}")
         model += [MimiConv1d(config, config.num_filters, config.audio_channels, config.last_kernel_size)]
         self.layers = nn.ModuleList(model)
+        self._mimiconv1d_layer_names = mimiconv1d_layer_names
+        self._mimiconvtranspose1d_layer_names = mimiconvtranspose1d_layer_names
 
-    # Copied from transformers.models.encodec.modeling_encodec.EncodecDecoder.forward
-    def forward(self, hidden_states):
+        # initialize layer_idx for the streaming submodules, necessary for the padding cache
+        for layer_idx, layer_name in enumerate(self._mimiconv1d_layer_names):
+            setattr(self.get_submodule(layer_name), "layer_idx", layer_idx)
+        for layer_idx, layer_name in enumerate(self._mimiconvtranspose1d_layer_names):
+            setattr(self.get_submodule(layer_name), "layer_idx", layer_idx)
+
+    def forward(self, hidden_states, padding_cache=None):
         for layer in self.layers:
-            hidden_states = layer(hidden_states)
+            if isinstance(layer, (MimiConv1d, MimiConvTranspose1d, MimiResnetBlock)):
+                hidden_states = layer(hidden_states, padding_cache=padding_cache)
+            else:
+                hidden_states = layer(hidden_states)
         return hidden_states
 
 
@@ -1226,6 +1307,11 @@ class MimiModel(MimiPreTrainedModel):
         self.decoder_transformer = MimiTransformerModel(config)
         self.decoder = MimiDecoder(config)
 
+        if self.upsample is not None:
+            # It runs ahead of the decoder's own transposed convolutions, so it takes the index after theirs, the
+            # way `downsample` takes the one after the encoder's convolutions.
+            self.upsample.layer_idx = len(self.decoder._mimiconvtranspose1d_layer_names)
+
         self.quantizer = MimiSplitResidualVectorQuantizer(config)
 
         self.bits_per_codebook = int(math.log2(self.config.codebook_size))
@@ -1397,27 +1483,36 @@ class MimiModel(MimiPreTrainedModel):
         self,
         codes: torch.Tensor,
         past_key_values: Cache | None = None,
+        padding_cache: MimiDecoderPaddingCache | None = None,
+        use_streaming: bool | None = None,
         return_dict: bool | None = None,
     ) -> torch.Tensor:
         embeddings = self.quantizer.decode(codes)
 
-        embeddings = self.upsample(embeddings)
+        embeddings = self.upsample(embeddings, padding_cache=padding_cache)
         decoder_outputs = self.decoder_transformer(
-            embeddings.transpose(1, 2), past_key_values=past_key_values, return_dict=return_dict
+            embeddings.transpose(1, 2),
+            past_key_values=past_key_values,
+            # As the encoder does. `config.use_cache` is `False`, so without this the transformer quietly ignores
+            # the cache it is handed and every chunk attends to itself alone.
+            use_cache=use_streaming,
+            return_dict=return_dict,
         )
         if return_dict:
             past_key_values = decoder_outputs.get("past_key_values")
         elif len(decoder_outputs) > 1:
             past_key_values = decoder_outputs[1]
         embeddings = decoder_outputs[0].transpose(1, 2)
-        outputs = self.decoder(embeddings)
-        return outputs, past_key_values
+        outputs = self.decoder(embeddings, padding_cache=padding_cache)
+        return outputs, past_key_values, padding_cache
 
     def decode(
         self,
         audio_codes: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
         decoder_past_key_values: Cache | None = None,
+        padding_cache: MimiDecoderPaddingCache | None = None,
+        use_streaming: bool | None = None,
         return_dict: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor] | MimiDecoderOutput:
         """
@@ -1440,14 +1535,28 @@ class MimiModel(MimiPreTrainedModel):
 
                 If `past_key_values` are used, the user can optionally input only the last `audio_values` or `audio_codes (those that don't
                 have their past key value states given to this model).
+            padding_cache (`MimiDecoderPaddingCache`, *optional*):
+                Convolution state carried over from a previous chunk of the same stream, as returned by an earlier
+                call. Built here on the first call when `use_streaming=True`.
+            use_streaming (`bool`, *optional*):
+                Whether the codes are one chunk of a longer stream. The decoder's convolutions then carry their
+                state across calls, so that decoding a stream chunk by chunk gives the same waveform as decoding it
+                in one go. Without it every chunk starts from silence, and the seam is audible at each boundary.
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
 
         """
         return_dict = return_dict if return_dict is not None else self.config.return_dict
 
-        audio_values, decoder_past_key_values = self._decode_frame(
-            audio_codes, past_key_values=decoder_past_key_values, return_dict=return_dict
+        if use_streaming and padding_cache is None:
+            padding_cache = self._build_decoder_padding_cache()
+
+        audio_values, decoder_past_key_values, padding_cache = self._decode_frame(
+            audio_codes,
+            past_key_values=decoder_past_key_values,
+            padding_cache=padding_cache,
+            use_streaming=use_streaming,
+            return_dict=return_dict,
         )
 
         # truncate based on padding mask
@@ -1458,8 +1567,30 @@ class MimiModel(MimiPreTrainedModel):
             return (
                 audio_values,
                 decoder_past_key_values,
+                padding_cache,
             )
-        return MimiDecoderOutput(audio_values, decoder_past_key_values)
+        return MimiDecoderOutput(audio_values, decoder_past_key_values, padding_cache)
+
+    def _build_decoder_padding_cache(self) -> MimiDecoderPaddingCache:
+        """Collect what the decoder's convolutions need to carry between chunks, as `encode` does for its own."""
+        per_layer_padding, per_layer_padding_mode, per_layer_in_channels = [], [], []
+        for layer_name in self.decoder._mimiconv1d_layer_names:
+            conv_layer = self.decoder.get_submodule(layer_name)
+            per_layer_padding.append(conv_layer.padding_total)
+            per_layer_padding_mode.append(conv_layer.pad_mode)
+            per_layer_in_channels.append(conv_layer.in_channels)
+
+        num_transpose_layers = len(self.decoder._mimiconvtranspose1d_layer_names)
+        if self.upsample is not None:
+            num_transpose_layers += 1
+
+        return MimiDecoderPaddingCache(
+            num_layers=len(self.decoder._mimiconv1d_layer_names),
+            per_layer_padding=per_layer_padding,
+            per_layer_padding_mode=per_layer_padding_mode,
+            per_layer_in_channels=per_layer_in_channels,
+            num_transpose_layers=num_transpose_layers,
+        )
 
     @auto_docstring
     def forward(
